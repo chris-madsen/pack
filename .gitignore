@@ -1,0 +1,24 @@
+# Rust / Cargo
+/target/
+**/target/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS / local junk
+.DS_Store
+Thumbs.db
+
+# Local diagnostics and scratch
+*.pid
+*.log
+*.tmp
+**/docs/tmp/
+/tmp/
+/out/
+*.pack
+*.packtmp
+*.unpacktmp
