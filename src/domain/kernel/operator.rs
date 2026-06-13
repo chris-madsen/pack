@@ -36,6 +36,13 @@ pub struct SpectralOperatorKey {
     pub phase: PhaseKey,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BinaryOperatorKey {
+    pub xor_mask: u64,
+    pub rotate: u8,
+    pub phase_mask: u64,
+}
+
 pub fn apply_phase_reflection(values: &mut [f64], key: &PhaseKey) -> Result<(), String> {
     key.validate()?;
     for (index, value) in values.iter_mut().enumerate() {
@@ -85,6 +92,41 @@ pub fn apply_u_k(values: &[f64], key: &SpectralOperatorKey) -> Result<Vec<f64>, 
     apply_fk_inverse(&state, key.mix)
 }
 
+pub fn apply_binary_u_k(value: u64, key: BinaryOperatorKey) -> u64 {
+    let rotate = key.rotate as u32 % 64;
+    let mixed = (value ^ key.xor_mask).rotate_left(rotate);
+    let spectral = binary_hadamard_forward(mixed);
+    let reflected = spectral ^ key.phase_mask;
+    binary_hadamard_inverse(reflected).rotate_right(rotate) ^ key.xor_mask
+}
+
+fn binary_hadamard_forward(mut value: u64) -> u64 {
+    for half_width in [1_usize, 2, 4, 8, 16, 32] {
+        value = cnot_stage(value, half_width);
+    }
+    value
+}
+
+fn binary_hadamard_inverse(mut value: u64) -> u64 {
+    for half_width in [32_usize, 16, 8, 4, 2, 1] {
+        value = cnot_stage(value, half_width);
+    }
+    value
+}
+
+fn cnot_stage(mut value: u64, half_width: usize) -> u64 {
+    let block_width = half_width * 2;
+    for block_start in (0..64).step_by(block_width) {
+        for offset in 0..half_width {
+            let control = block_start + offset;
+            let target = control + half_width;
+            let bit = (value >> control) & 1;
+            value ^= bit << target;
+        }
+    }
+    value
+}
+
 fn phase_bit(index: u64, key: &PhaseKey) -> u8 {
     let mut value = index ^ key.seed;
     value ^= value.wrapping_shl(key.shift_left as u32);
@@ -120,8 +162,8 @@ fn validate_vector(values: &[f64]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_fk, apply_fk_inverse, apply_phase_reflection, apply_u_k, IndexMix, PhaseKey,
-        SpectralOperatorKey,
+        apply_binary_u_k, apply_fk, apply_fk_inverse, apply_phase_reflection, apply_u_k,
+        BinaryOperatorKey, IndexMix, PhaseKey, SpectralOperatorKey,
     };
 
     fn phase_key() -> PhaseKey {
@@ -216,5 +258,17 @@ mod tests {
         )
         .unwrap();
         assert_ne!(left, right);
+    }
+
+    #[test]
+    fn binary_u_k_is_an_exact_involution_for_word_codec() {
+        let key = BinaryOperatorKey {
+            xor_mask: 0x0123_4567_89AB_CDEF,
+            rotate: 17,
+            phase_mask: 0xF0F0_0F0F_AAAA_5555,
+        };
+        for value in [0, 1, u64::MAX, 0xDEAD_BEEF_CAFE_BABE] {
+            assert_eq!(apply_binary_u_k(apply_binary_u_k(value, key), key), value);
+        }
     }
 }

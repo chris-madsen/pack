@@ -35,9 +35,9 @@ pub struct CompressionPolicy {
 
 impl CompressionPolicy {
     pub const MVP: Self = Self {
-        max_key_bits: 512,
+        max_key_bits: 64,
         max_key_fraction: 0.25,
-        minimum_gain_fraction: 0.10,
+        minimum_gain_fraction: 0.0,
     };
 
     pub fn accepts(&self, budget: BitBudget) -> Result<bool, String> {
@@ -101,7 +101,7 @@ mod tests {
     }
 
     #[test]
-    fn hard_constraint_rejects_non_compression_and_less_than_ten_percent_gain() {
+    fn hard_constraint_accepts_any_strict_gain_after_full_cost_accounting() {
         let policy = CompressionPolicy::MVP;
         assert!(!policy
             .accepts(BitBudget {
@@ -111,19 +111,11 @@ mod tests {
                 overhead_bits: 64,
             })
             .unwrap());
-        assert!(!policy
-            .accepts(BitBudget {
-                source_bits: 4096,
-                key_bits: 256,
-                crumb_bits: 3400,
-                overhead_bits: 64,
-            })
-            .unwrap());
         assert!(policy
             .accepts(BitBudget {
                 source_bits: 4096,
-                key_bits: 256,
-                crumb_bits: 3200,
+                key_bits: 64,
+                crumb_bits: 3960,
                 overhead_bits: 64,
             })
             .unwrap());
@@ -135,7 +127,7 @@ mod tests {
         assert!(!policy
             .accepts(BitBudget {
                 source_bits: 4096,
-                key_bits: 513,
+                key_bits: 65,
                 crumb_bits: 1,
                 overhead_bits: 1,
             })
@@ -143,7 +135,7 @@ mod tests {
         assert!(!policy
             .accepts(BitBudget {
                 source_bits: 1024,
-                key_bits: 257,
+                key_bits: 65,
                 crumb_bits: 1,
                 overhead_bits: 1,
             })

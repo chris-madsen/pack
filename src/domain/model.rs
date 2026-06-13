@@ -47,6 +47,8 @@ pub struct SpectralBlock {
 pub struct TrajectoryBlock {
     pub original_len: u32,
     pub key: Vec<u8>,
+    pub terminal: u64,
+    pub steps: u8,
     pub breadcrumbs: Vec<u8>,
 }
 
@@ -55,6 +57,7 @@ pub struct OperatorBlock {
     pub original_len: u32,
     pub key: Vec<u8>,
     pub terminal: u64,
+    pub steps: u8,
     pub breadcrumbs: Vec<u8>,
 }
 

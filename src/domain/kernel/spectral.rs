@@ -43,9 +43,43 @@ pub fn strongest_walsh_peaks(spectrum: &[f64], count: usize) -> Vec<SpectralPeak
     peaks
 }
 
+pub fn synthesise_spectral_bits(program: &SpectralProgram) -> Result<Vec<u8>, String> {
+    if program.peaks.is_empty() {
+        return Err("spectral program contains no Walsh peaks".to_string());
+    }
+    if program
+        .peaks
+        .iter()
+        .any(|peak| peak.index >= program.bit_len)
+    {
+        return Err("spectral program peak is outside the block".to_string());
+    }
+
+    Ok((0..program.bit_len)
+        .map(|position| {
+            let score = program.peaks.iter().fold(0_i32, |score, peak| {
+                let basis = if (peak.index & position).count_ones() & 1 == 0 {
+                    1
+                } else {
+                    -1
+                };
+                let weighted = basis * peak.amplitude as i32;
+                score + if peak.positive { weighted } else { -weighted }
+            });
+            if score > 0 || (score == 0 && program.tie_bit) {
+                1
+            } else {
+                0
+            }
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{normalized_fwht, strongest_walsh_peaks};
+    use crate::domain::kernel::key::{SpectralPeakCode, SpectralProgram};
+
+    use super::{normalized_fwht, strongest_walsh_peaks, synthesise_spectral_bits};
 
     fn assert_close(left: &[f64], right: &[f64]) {
         assert_eq!(left.len(), right.len());
@@ -87,4 +121,23 @@ mod tests {
     fn fwht_rejects_non_power_of_two_lengths() {
         assert!(normalized_fwht(&mut [1.0, 2.0, 3.0]).is_err());
     }
+
+    #[test]
+    fn spectral_program_expands_a_walsh_basis_without_prng_state() {
+        let program = SpectralProgram {
+            bit_len: 32,
+            peaks: vec![SpectralPeakCode {
+                index: 0b10101,
+                positive: true,
+                amplitude: 31,
+            }],
+            tie_bit: false,
+        };
+        let bits = synthesise_spectral_bits(&program).unwrap();
+        for (position, bit) in bits.iter().enumerate() {
+            let expected = u8::from((position & 0b10101).count_ones() & 1 == 0);
+            assert_eq!(*bit, expected);
+        }
+    }
 }
+use crate::domain::kernel::key::SpectralProgram;

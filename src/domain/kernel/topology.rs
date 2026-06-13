@@ -1,5 +1,4 @@
-use crate::domain::kernel::base::{generate_base_from_root, standard_base, PatternId, RootSeed};
-use crate::domain::kernel::key::{KeyHeader, KeySegment, MagicKey, SegmentKind};
+use crate::domain::kernel::key::{MagicKey, SpectralPeakCode, SpectralProgram, MAX_SPECTRAL_PEAKS};
 use crate::domain::kernel::spectral::{normalized_fwht, strongest_walsh_peaks, SpectralPeak};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -131,104 +130,88 @@ pub fn compile_topology_to_key(signature: &TopologySignature) -> Result<MagicKey
         return Err("signature lacks required topology features".to_string());
     }
 
-    let strongest_shift = signature.shift_scores[0].shift;
-    let secondary_shift = signature
-        .shift_scores
-        .get(1)
-        .map(|score| score.shift)
-        .unwrap_or(strongest_shift);
-    let derivative_ones = signature
-        .derivative
+    let derivative_fold =
+        signature
+            .derivative
+            .chunks(64)
+            .enumerate()
+            .fold(0_u64, |state, (chunk_index, chunk)| {
+                let word = chunk
+                    .iter()
+                    .enumerate()
+                    .fold(0_u64, |word, (bit, value)| word | ((*value as u64) << bit));
+                avalanche(state ^ word.rotate_left((chunk_index % 64) as u32))
+            });
+    let popcnt_fold = signature
+        .popcnt_profile
         .iter()
-        .map(|bit| *bit as usize)
-        .sum::<usize>();
+        .enumerate()
+        .fold(0_u64, |state, (index, count)| {
+            state ^ (*count as u64).rotate_left((index % 64) as u32)
+        });
+    let shift_fold =
+        signature
+            .shift_scores
+            .iter()
+            .enumerate()
+            .fold(0_u64, |state, (rank, score)| {
+                state
+                    ^ (score.shift as u64).rotate_left((rank * 11) as u32)
+                    ^ (score.matching_bits as u64).rotate_right((rank * 7) as u32)
+            });
+    let peak_fold = signature
+        .walsh_peaks
+        .iter()
+        .enumerate()
+        .fold(0_u64, |state, (rank, peak)| {
+            let signed_index = (peak.index as u64)
+                ^ if peak.coefficient.is_sign_negative() {
+                    u64::MAX
+                } else {
+                    0
+                };
+            state ^ signed_index.rotate_left((rank * 13) as u32)
+        });
+    Ok(MagicKey::from_raw(avalanche(
+        signature.fingerprint
+            ^ derivative_fold.rotate_left(7)
+            ^ popcnt_fold.rotate_left(19)
+            ^ shift_fold.rotate_left(31)
+            ^ peak_fold,
+    )))
+}
+
+pub fn compile_spectral_key(signature: &TopologySignature) -> Result<MagicKey, String> {
+    if signature.bit_len == 0 || !signature.bit_len.is_power_of_two() {
+        return Err("signature bit length must be a power of two".to_string());
+    }
+    let strongest = signature
+        .walsh_peaks
+        .iter()
+        .map(|peak| peak.coefficient.abs())
+        .fold(0.0_f64, f64::max);
+    let peaks = signature
+        .walsh_peaks
+        .iter()
+        .filter(|peak| peak.coefficient.abs() > 1e-12)
+        .take(MAX_SPECTRAL_PEAKS)
+        .map(|peak| SpectralPeakCode {
+            index: peak.index,
+            positive: !peak.coefficient.is_sign_negative(),
+            amplitude: ((peak.coefficient.abs() / strongest * 31.0).round() as u8).max(1),
+        })
+        .collect::<Vec<_>>();
+    let derivative_ones = signature.derivative.iter().filter(|bit| **bit == 1).count();
     let popcnt_sum = signature
         .popcnt_profile
         .iter()
         .map(|count| *count as usize)
         .sum::<usize>();
-    let peak_selector = signature
-        .walsh_peaks
-        .iter()
-        .enumerate()
-        .fold(0_usize, |acc, (rank, peak)| {
-            acc ^ peak.index.rotate_left((rank % usize::BITS as usize) as u32)
-        });
-    let multipliers = [
-        0x9E37_79B9_7F4A_7C15_u64,
-        0xBF58_476D_1CE4_E5B9,
-        0x94D0_49BB_1331_11EB,
-        0xD6E8_FEB8_6659_FD93,
-    ];
-    let odd_multiplier =
-        multipliers[(peak_selector ^ derivative_ones ^ popcnt_sum) % multipliers.len()];
-    let phase_mask = signature.walsh_peaks.iter().fold(0_u64, |mask, peak| {
-        let bit = 1_u64 << (peak.index % 64);
-        if peak.coefficient.is_sign_negative() {
-            mask ^ bit.rotate_left(1)
-        } else {
-            mask ^ bit
-        }
-    }) ^ (derivative_ones as u64).rotate_left(17);
-    let program_root = signature.fingerprint
-        ^ (popcnt_sum as u64).rotate_left(11)
-        ^ (derivative_ones as u64).rotate_left(29)
-        ^ phase_mask;
-    let generated = generate_base_from_root(
-        &standard_base(1)?,
-        RootSeed {
-            value: program_root,
-        },
-    )?;
-    let program = generated
-        .operation_schedule
-        .iter()
-        .map(|operation| *operation as u8)
-        .collect::<Vec<_>>();
-
-    let key = MagicKey {
-        header: KeyHeader {
-            version: 1,
-            main_pattern_id: PatternId::SpectralInvolution,
-            rounds: program.len() as u8,
-            block_log2: signature.bit_len.ilog2() as u8,
-            flags: 0,
-        },
-        segments: vec![
-            KeySegment {
-                kind: SegmentKind::RevMix,
-                payload: vec![
-                    (signature.walsh_peaks[0].index % 64) as u8,
-                    (strongest_shift % 64) as u8,
-                ],
-            },
-            KeySegment {
-                kind: SegmentKind::PhaseMask,
-                payload: phase_mask.to_le_bytes().to_vec(),
-            },
-            KeySegment {
-                kind: SegmentKind::WalshConfig,
-                payload: {
-                    let mut payload = vec![
-                        (strongest_shift % 31 + 1) as u8,
-                        (secondary_shift % 31 + 1) as u8,
-                    ];
-                    payload.extend_from_slice(&odd_multiplier.to_le_bytes());
-                    payload
-                },
-            },
-            KeySegment {
-                kind: SegmentKind::Program,
-                payload: program,
-            },
-            KeySegment {
-                kind: SegmentKind::AuxConst,
-                payload: signature.fingerprint.to_le_bytes().to_vec(),
-            },
-        ],
-    };
-    key.validate()?;
-    Ok(key)
+    MagicKey::from_spectral_program(&SpectralProgram {
+        bit_len: signature.bit_len,
+        peaks,
+        tie_bit: ((derivative_ones ^ popcnt_sum) & 1) == 1,
+    })
 }
 
 fn validate_bits(bits: &[u8]) -> Result<(), String> {
@@ -248,12 +231,9 @@ fn avalanche(mut value: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use crate::domain::kernel::base::OperationCode;
-    use crate::domain::kernel::key::SegmentKind;
-
     use super::{
-        analyze_topology, block_fingerprint, circular_bit_derivative, compile_topology_to_key,
-        popcnt_profile, shift_correlation,
+        analyze_topology, block_fingerprint, circular_bit_derivative, compile_spectral_key,
+        compile_topology_to_key, popcnt_profile, shift_correlation,
     };
 
     #[test]
@@ -289,114 +269,68 @@ mod tests {
         let second = compile_topology_to_key(&signature).unwrap();
         assert_eq!(first, second);
 
-        let rev_mix = first
-            .segments
-            .iter()
-            .find(|segment| segment.kind == SegmentKind::RevMix)
-            .unwrap();
-        assert_eq!(rev_mix.payload.len(), 2);
+        assert_eq!(first.bit_len(), 64);
+        assert_ne!(first.raw(), 0);
 
-        let walsh = first
-            .segments
-            .iter()
-            .find(|segment| segment.kind == SegmentKind::WalshConfig)
-            .unwrap();
-        assert_eq!(walsh.payload.len(), 10);
-        let multiplier = u64::from_le_bytes(walsh.payload[2..10].try_into().unwrap());
-        assert_eq!(multiplier & 1, 1);
-
-        let phase = first
-            .segments
-            .iter()
-            .find(|segment| segment.kind == SegmentKind::PhaseMask)
-            .unwrap();
-        let phase_mask = u64::from_le_bytes(phase.payload.clone().try_into().unwrap());
-        assert_ne!(phase_mask, 0);
-
-        let program = first
-            .segments
-            .iter()
-            .find(|segment| segment.kind == SegmentKind::Program)
-            .unwrap();
-        assert_eq!(program.payload.len(), 8);
-        assert!(program
-            .payload
-            .iter()
-            .all(|code| OperationCode::try_from(*code).is_ok()));
-
-        let aux = first
-            .segments
-            .iter()
-            .find(|segment| segment.kind == SegmentKind::AuxConst)
-            .unwrap();
+        let spectral = compile_spectral_key(&signature).unwrap();
+        let program = spectral.spectral_program().unwrap();
+        assert_eq!(program.bit_len, signature.bit_len);
         assert_eq!(
-            u64::from_le_bytes(aux.payload.as_slice().try_into().unwrap()),
-            signature.fingerprint
+            program.peaks.len(),
+            signature
+                .walsh_peaks
+                .iter()
+                .filter(|peak| peak.coefficient.abs() > 1e-12)
+                .count()
+                .min(4)
         );
+        assert_eq!(spectral.serialize().len(), 8);
     }
 
     #[test]
     fn changing_block_topology_changes_compiled_k() {
         let left = compile_topology_to_key(&analyze_topology(&[0xAA; 64]).unwrap()).unwrap();
         let right = compile_topology_to_key(&analyze_topology(&[0xF0; 64]).unwrap()).unwrap();
-        assert_ne!(left.serialize().unwrap(), right.serialize().unwrap());
+        assert_ne!(left.serialize(), right.serialize());
     }
 
     #[test]
     fn every_topology_profile_materially_changes_compiled_k() {
         let signature = analyze_topology(&[0xA5; 64]).unwrap();
-        let baseline = compile_topology_to_key(&signature)
-            .unwrap()
-            .serialize()
-            .unwrap();
+        let baseline = compile_topology_to_key(&signature).unwrap().serialize();
 
         let mut changed = signature.clone();
         changed.walsh_peaks[0].index = (changed.walsh_peaks[0].index + 1) % changed.bit_len;
         assert_ne!(
-            compile_topology_to_key(&changed)
-                .unwrap()
-                .serialize()
-                .unwrap(),
+            compile_topology_to_key(&changed).unwrap().serialize(),
             baseline
         );
 
         let mut changed = signature.clone();
         changed.shift_scores[0].shift = changed.shift_scores[0].shift % 31 + 1;
         assert_ne!(
-            compile_topology_to_key(&changed)
-                .unwrap()
-                .serialize()
-                .unwrap(),
+            compile_topology_to_key(&changed).unwrap().serialize(),
             baseline
         );
 
         let mut changed = signature.clone();
         changed.derivative[0] ^= 1;
         assert_ne!(
-            compile_topology_to_key(&changed)
-                .unwrap()
-                .serialize()
-                .unwrap(),
+            compile_topology_to_key(&changed).unwrap().serialize(),
             baseline
         );
 
         let mut changed = signature.clone();
         changed.popcnt_profile[0] ^= 1;
         assert_ne!(
-            compile_topology_to_key(&changed)
-                .unwrap()
-                .serialize()
-                .unwrap(),
+            compile_topology_to_key(&changed).unwrap().serialize(),
             baseline
         );
 
         let mut changed = signature;
         changed.fingerprint ^= 1;
         assert_ne!(
-            compile_topology_to_key(&changed)
-                .unwrap()
-                .serialize()
-                .unwrap(),
+            compile_topology_to_key(&changed).unwrap().serialize(),
             baseline
         );
     }

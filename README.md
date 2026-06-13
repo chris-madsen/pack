@@ -10,9 +10,9 @@ executable block generator and a correction vector `V` restores the exact input.
 ```text
 input block
   -> topology analysis
-  -> executable K (maximum 512 bits)
-  -> exact self-inverse Program + Feistel + U_K path
-  -> shared terminal + parity trajectory V
+  -> one 64-bit magic constant K
+  -> weighted Walsh predictor or exact binary U_K
+  -> canonical exception addresses or parity trajectory V
   -> strict K + V + overhead budget
   -> recursive archive layers
 ```

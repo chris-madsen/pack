@@ -297,40 +297,33 @@ ArchiveRoot {
 - мини-байткод/IR для отдельных частей;
 - константы для обратимых операторов.
 
-### 6.2. Гибридная структура `K`
+### 6.2. Компактная структура `K`
 
 Нормативная форма для MVP:
 
 ```text
-K = KHeader || SegmentDirectory || SegmentPayloads
+K = u64
 ```
 
-Где:
+Одна 64-битная константа разворачивается общей базой в конкретный алгоритм.
+Для spectral-паттерна раскладка фиксирована:
 
 ```text
-KHeader {
-  version,
-  main_pattern_id,
-  rounds,
-  block_log2,
-  segment_count,
-  k_flags
-}
+3 × Walsh index[13]
+3 × amplitude[5]
+3 × sign[1]
+peak_count[2]
+block_log2[4]
+tie_bit[1]
 ```
 
-`main_pattern_id` задаёт **порядок вызова** сегментов.  
-Сегменты содержат детали соответствующих подалгоритмов.
+Версия базы и тип паттерна задаются контейнером, поэтому не дублируются внутри
+`K`.
 
 ### 6.3. Семантика верхнего шаблона
 
-Верхний шаблон `main_pattern_id` играет роль “main-функции”:
-
-- он не хранит все детали реализации;
-- он определяет, какие сегменты участвуют;
-- он задаёт порядок их применения;
-- он фиксирует композицию операторов.
-
-Это соответствует примеру из `docs/magic_example1.md`, где одна константа раскладывается на смысловые части:
+Константа трактуется как “main-функция”: фиксированные битовые поля являются
+частями алгоритма, как в `docs/magic_example1.md`:
 
 ```text
 part_1, part_2, part_3
@@ -338,25 +331,22 @@ part_1, part_2, part_3
 
 и каждая часть отвечает за свой подалгоритм.
 
-### 6.4. Сегменты `K`
+### 6.4. Разворачивание алгоритма
 
-Для MVP вводятся следующие типы сегментов:
-
-- `REV_MIX` — параметры обратимого битового перемешивания;
-- `PHASE_MASK` — параметры фазовой/знаковой маски;
-- `WALSH_CFG` — параметры блока Walsh–Hadamard;
-- `CRUMB_CFG` — правила генерации и интерпретации `V`;
-- `AUX_CONST` — дополнительные константы.
+- spectral-паттерн читает координаты, относительные амплитуды и знаки пиков;
+- operator-паттерн использует всё значение `K` как корень общей базы;
+- расписание операций, ARX-параметры, фазовая маска и Feistel-раунды
+  детерминированно выводятся локально и не сериализуются.
 
 ### 6.5. Верхняя граница на размер `K`
 
 Для MVP принимается ограничение:
 
 ```text
-|K| <= min(512 бит, |N| / 4)
+|K| = 64 бит
 ```
 
-Это рабочее стартовое ограничение для прототипа. Оно выбрано как инженерный барьер против разрастания описания. В будущих версиях оно может быть адаптивным.
+Дополнительно сохраняется экономическое ограничение `|K| <= |N| / 4`.
 
 ### 6.6. Требования к сериализуемости и декодируемости
 
@@ -462,10 +452,10 @@ crumb_ratio = |V| / |N|
 
 ### 8.5. Многошаговый генератор
 
-Многошаговый генератор в `K` представляется как:
+Многошаговый генератор разворачивается как:
 
 ```text
-main_pattern_id + ordered segments + segment payloads + round count
+Expand(B_STD, K, block_mode)
 ```
 
 ---
@@ -541,7 +531,7 @@ Walsh–Hadamard используется в двух качествах:
 analyze(N)
 -> derive feature set P
 -> choose main_pattern_id by deterministic rules
--> instantiate segments
+-> compile parameters into one u64 K
 -> validate invertibility
 -> emit K
 ```
@@ -585,7 +575,7 @@ MG_B(N) = (K, V)
 где:
 
 ```text
-N -> T(N) -> pattern_id -> segment synthesis -> K -> V
+N -> T(N) -> pattern_id -> compact parameter synthesis -> K -> V
 ```
 
 А именно:
@@ -735,11 +725,15 @@ ALPHABET_BREADCRUMBS
 gain = 1 - (|K| + |V| + overhead) / |N| >= τ
 ```
 
-Для MVP по умолчанию допускается:
+Для блочного MVP:
 
 ```text
-τ = 0.10
+τ = 0
 ```
+
+При этом неравенство остаётся строгим: равный размер не принимается. Полный
+рекурсивный слой также принимается только при уменьшении контейнера со всеми
+заголовками.
 
 ### 12.3. Терминальный режим
 
@@ -871,11 +865,14 @@ score(B) = predicted_K_bits(B) + predicted_V_bits(B) + overhead(B)
 
 ### 16.1. Формат `K`
 
-Гибридный:
+Одна магическая константа:
 
 ```text
-KHeader + SegmentDirectory + SegmentPayloads
+u64
 ```
+
+Смысл полей определяется версией общей базы и режимом блока в контейнере.
+Декодер обязан отвергать любую ширину `K`, отличную от восьми байт.
 
 ### 16.2. Алфавит операций
 
@@ -981,7 +978,9 @@ ALPHABET_BREADCRUMBS
 
 - parse -> serialize -> parse;
 - сравнение семантики до и после сериализации;
-- проверка всех segment types.
+- проверка точной ширины 64 бита;
+- проверка влияния каждого семантического поля на развёрнутый алгоритм;
+- отказ на неканонической или неверной длине.
 
 ### 18.3. Тесты на восстановление из `V`
 
@@ -1070,7 +1069,7 @@ MVP считается успешным, если:
 - точная семантика траекторного потребления `V` для разных паттернов;
 - финальный бинарный wire-format;
 - правила оценки перспективности следующего слоя;
-- диапазон допустимых segment types;
+- диапазон допустимых версий базы и режимов интерпретации `K`;
 - критерий переключения на adaptive block sizing.
 
 ---
@@ -1097,9 +1096,9 @@ MVP считается успешным, если:
 - сравнить несколько политик на одинаковых данных;
 - учесть стоимость анализа.
 
-### Этап 4. Более сложные классы `K`
+### Этап 4. Более сложные интерпретации `K`
 
-- расширить набор segment types;
+- добавить новые версии детерминированного `Expand(B_STD, K, block_mode)`;
 - добавить новые `main_pattern_id`;
 - исследовать палиндромные композиции операторов.
 
@@ -1131,7 +1130,7 @@ X -> part_1 + part_2 + part_3 + ...
 
 На момент версии `draft v0.1` приняты следующие решения:
 
-- `K` — гибридный формат;
+- `K` — одна 64-битная магическая константа;
 - `V` — вектор чётности, а не XOR-остаток;
 - первый операторный паттерн — `U_K = F_K⁻¹ · H · D_K · H · F_K`;
 - MVP работает на фиксированном блоке 4096 бит;
@@ -1141,25 +1140,18 @@ X -> part_1 + part_2 + part_3 + ...
 
 ## Appendix C. Executable K amendment (implemented 2026-06-13)
 
-The current MVP encodes the operator algorithm in five canonical `K` segments:
-
-```text
-RevMix | PhaseMask | WalshConfig | Program | AuxConst
-```
-
-- `Program` is an ordered sequence of operation codes from versioned `B_STD`.
-- `AuxConst` is derived from the complete block, not from a fixed prefix.
-- Walsh peaks, shift correlation, bit derivative, and popcount profile all
-  influence compilation.
-- The runtime validates every instruction and rejects directly irreversible
-  operations outside a Feistel/phase context.
-- Operator execution uses exact word-level
+- `K` is exactly one `u64`.
+- Spectral encode is part of the real candidate path.
+- Spectral `K` stores three weighted Walsh peaks and expands them into a
+  deterministic inverse-Walsh predictor without PRNG state.
+- Spectral `V` is a canonical stream of increasing exception addresses.
+- Operator `K` is a root from which `B_STD` expands the reversible schedule,
+  phase, and Feistel parameters.
+- Operator execution uses the exact binary butterfly kernel
   `U_K = F_K^-1 · H^-1 · D_K · H · F_K`.
-- The shared terminal is explicit overhead.
-- Operator `V` is only the canonical parity/branch stream consumed by the
-  reverse trajectory; it is not an XOR residual.
-- A block is accepted only when `K + V + overhead` satisfies the configured
-  strict compression budget.
+- Operator mode is rejected unless it strictly shortens the parity trajectory
+  relative to the original words.
+- A block is accepted only when `K + V + overhead < N`.
 
 The former zero-valued spectral fallback and codec-generated `>=10x` quality
 fixtures are forbidden. Compression quality must be reported on external files.
@@ -1171,5 +1163,6 @@ Current external noise result:
 compression factor = 1.1362x
 ```
 
-Therefore the executable-path integration is complete, while the `>=10x`
-metagenerator quality objective remains open.
+The external noise result is still selected by the alphabet baseline. Spectral
+is now implemented and testably selected on Walsh-structured inputs, while the
+`>=10x` metagenerator quality objective remains open.
