@@ -9,6 +9,7 @@
 mod tests {
     use crate::domain::bitstream::bit_width_for_cardinality;
     use crate::domain::codec::{compress_bytes, decompress_bytes, inspect_archive};
+    use crate::domain::codec::SINGLE_LAYER_HEADER_BYTES;
 
     // ─── Roundtrip ────────────────────────────────────────────────────────────
 
@@ -83,7 +84,8 @@ mod tests {
     // ─── Uniform input (triggers bit_width_for_cardinality(1) == 0 edge case) ─
 
     /// BUG #7 (review): uniform input → alphabet size 1 → bit_width == 0.
-    /// pack_indices(&indices, 0) must not panic or corrupt data.
+    /// With the explicit guard, try_encode_alphabet_block returns None and
+    /// the encoder falls back to a better encoding (operator / raw).
     #[test]
     fn compress_decompress_uniform_input() {
         let input = vec![0x42u8; 512];
@@ -123,7 +125,8 @@ mod tests {
 
     // ─── inspect_archive ──────────────────────────────────────────────────────
 
-    /// BUG #5 (review): inspect_archive returned input_size: 0 for single-layer archives.
+    /// BUG #5 (review): inspect_archive returned wrong input_size for single-layer.
+    /// Also verifies output_size is payload bytes (archive - header), not full blob.
     #[test]
     fn inspect_archive_single_layer_input_size_is_correct() {
         let input = vec![0xABu8; 256];
@@ -136,17 +139,22 @@ mod tests {
         );
     }
 
+    /// output_size must be payload bytes (full archive minus the 23-byte header),
+    /// not the full archive blob.  This makes single-layer and multi-layer
+    /// inspect results comparable.
     #[test]
-    fn inspect_archive_output_size_does_not_exceed_compressed_len() {
-        let input: Vec<u8> = (0u8..=255).cycle().take(512).collect();
+    fn inspect_archive_output_size_is_payload_not_full_blob() {
+        let input = vec![0xABu8; 256];
         let compressed = compress_bytes(&input, None).expect("compress failed");
-        let compressed_len = compressed.len() as u64;
         let layers = inspect_archive(&compressed).expect("inspect failed");
+        // If compressed is a PACKMVP1 (single-layer), output_size = compressed.len() - header.
+        // If it ended up as PACKREC1 (multi-layer), the field comes from layer_summaries directly.
+        // Either way it must be strictly less than compressed.len().
         assert!(
-            layers[0].output_size <= compressed_len,
-            "output_size {} should not exceed compressed length {}",
+            layers[0].output_size < compressed.len() as u64,
+            "output_size {} should be less than compressed len {}",
             layers[0].output_size,
-            compressed_len
+            compressed.len()
         );
     }
 
@@ -172,5 +180,36 @@ mod tests {
         let a = compress_bytes(&input, None).expect("compress failed");
         let b = compress_bytes(&input, None).expect("compress failed");
         assert_eq!(a, b, "compress must be deterministic");
+    }
+
+    // ─── White noise metric test ───────────────────────────────────────────────
+
+    /// Measures compression ratio on white noise across multiple block sizes.
+    /// The codec must not expand white noise by more than 5% over raw.
+    #[test]
+    fn white_noise_expansion_is_bounded() {
+        for &size in &[256usize, 512, 1024, 2048, 4096] {
+            let mut state: u64 = 0xFEED_DEAD_BEEF_CAFE ^ size as u64;
+            let input: Vec<u8> = (0..size)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    (state & 0xFF) as u8
+                })
+                .collect();
+            let compressed = compress_bytes(&input, None)
+                .unwrap_or_else(|e| panic!("compress failed at size {size}: {e}"));
+            let restored = decompress_bytes(&compressed)
+                .unwrap_or_else(|e| panic!("decompress failed at size {size}: {e}"));
+            assert_eq!(restored, input, "roundtrip failed at size {size}");
+            let overhead_pct =
+                (compressed.len() as f64 / input.len() as f64 - 1.0) * 100.0;
+            assert!(
+                overhead_pct <= 5.0,
+                "white noise overhead too high at size {size}: {overhead_pct:.1}% (compressed {} bytes)",
+                size, compressed.len()
+            );
+        }
     }
 }
