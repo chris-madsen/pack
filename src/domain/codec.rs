@@ -23,7 +23,7 @@ use crate::domain::kernel::trajectory::{
 };
 use crate::domain::model::{
     AlphabetBlock, Archive, ArchiveHeader, BlockAnalysis, BlockEncoding, LayerSummary,
-    OperatorBlock, RawBlock, SpectralBlock, TrajectoryBlock,
+    OperatorBlock, RawBlock, SparseAlphabetBlock, SpectralBlock, TrajectoryBlock,
 };
 
 const MAGIC_SINGLE: &[u8; 8] = b"PACKMVP1";
@@ -139,6 +139,7 @@ fn encode_block(block: &[u8]) -> Result<BlockEncoding, String> {
     let maybe_operator = try_encode_operator_block(block)?;
     let maybe_spectral = try_encode_spectral_block(block)?;
     let maybe_trajectory = try_encode_trajectory_block(block)?;
+    let maybe_sparse_alphabet = try_encode_sparse_alphabet_block(block, &analysis)?;
     let maybe_alphabet = try_encode_alphabet_block(block, &analysis)?;
     let mut best = raw;
 
@@ -153,6 +154,11 @@ fn encode_block(block: &[u8]) -> Result<BlockEncoding, String> {
         }
     }
     if let Some(candidate) = maybe_trajectory {
+        if encoded_size_of(&candidate) < encoded_size_of(&best) {
+            best = candidate;
+        }
+    }
+    if let Some(candidate) = maybe_sparse_alphabet {
         if encoded_size_of(&candidate) < encoded_size_of(&best) {
             best = candidate;
         }
@@ -338,6 +344,10 @@ fn decompress_single_layer_bytes(input: &[u8]) -> Result<Vec<u8>, String> {
                 let restored = decode_alphabet_block(&alpha)?;
                 out.extend_from_slice(&restored);
             }
+            BlockEncoding::SparseAlphabet(alpha) => {
+                let restored = decode_sparse_alphabet_block(&alpha)?;
+                out.extend_from_slice(&restored);
+            }
             BlockEncoding::Spectral(spectral) => {
                 let restored = decode_spectral_block(&spectral)?;
                 out.extend_from_slice(&restored);
@@ -396,6 +406,109 @@ fn try_encode_alphabet_block(
         bit_width,
         breadcrumbs,
     })))
+}
+
+fn try_encode_sparse_alphabet_block(
+    block: &[u8],
+    analysis: &BlockAnalysis,
+) -> Result<Option<BlockEncoding>, String> {
+    if analysis.unique_sorted_bytes.len() <= 1 {
+        return Ok(None);
+    }
+
+    let counts = block
+        .iter()
+        .copied()
+        .fold(BTreeMap::new(), |mut map, byte| {
+            *map.entry(byte).or_insert(0_usize) += 1;
+            map
+        });
+    let mut rarest = counts
+        .into_iter()
+        .map(|(byte, count)| (count, byte))
+        .collect::<Vec<_>>();
+    rarest.sort();
+
+    let mut best: Option<BlockEncoding> = None;
+    for exception_count in 1..=3 {
+        let exception_alphabet = rarest
+            .iter()
+            .take(exception_count)
+            .map(|(_, byte)| *byte)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if exception_alphabet.is_empty()
+            || exception_alphabet.len() >= analysis.unique_sorted_bytes.len()
+        {
+            continue;
+        }
+        let dense_alphabet = analysis
+            .unique_sorted_bytes
+            .iter()
+            .copied()
+            .filter(|byte| !exception_alphabet.contains(byte))
+            .collect::<Vec<_>>();
+        let dense_bit_width = bit_width_for_cardinality(dense_alphabet.len());
+        if dense_bit_width >= 8 {
+            continue;
+        }
+
+        let dense_index_by_byte = dense_alphabet
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, byte)| (byte, index as u8))
+            .collect::<BTreeMap<_, _>>();
+        let exception_index_by_byte = exception_alphabet
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, byte)| (byte, index as u8))
+            .collect::<BTreeMap<_, _>>();
+
+        let mut dense_indices = Vec::with_capacity(block.len());
+        let mut exception_indices = Vec::new();
+        let mut exception_positions = Vec::new();
+        for (position, byte) in block.iter().copied().enumerate() {
+            if let Some(index) = exception_index_by_byte.get(&byte).copied() {
+                exception_indices.push(index);
+                exception_positions.push(position);
+            } else {
+                dense_indices.push(
+                    dense_index_by_byte
+                        .get(&byte)
+                        .copied()
+                        .ok_or_else(|| "dense alphabet lookup failed".to_string())?,
+                );
+            }
+        }
+        if exception_indices.is_empty() {
+            continue;
+        }
+
+        let candidate = BlockEncoding::SparseAlphabet(SparseAlphabetBlock {
+            original_len: block.len() as u32,
+            dense_alphabet: dense_alphabet.clone(),
+            dense_bit_width,
+            dense_breadcrumbs: pack_indices(&dense_indices, dense_bit_width),
+            exception_alphabet: exception_alphabet.clone(),
+            exception_indices: pack_indices(
+                &exception_indices,
+                bit_width_for_cardinality(exception_alphabet.len()),
+            ),
+            exception_positions: encode_position_deltas(&exception_positions),
+        });
+        if best
+            .as_ref()
+            .map(|current| encoded_size_of(&candidate) < encoded_size_of(current))
+            .unwrap_or(true)
+        {
+            best = Some(candidate);
+        }
+    }
+
+    Ok(best)
 }
 
 fn try_encode_trajectory_block(block: &[u8]) -> Result<Option<BlockEncoding>, String> {
@@ -672,6 +785,57 @@ fn decode_alphabet_block(block: &AlphabetBlock) -> Result<Vec<u8>, String> {
             .copied()
             .ok_or_else(|| "decoded alphabet index is out of range".to_string())?;
         out.push(byte);
+    }
+    Ok(out)
+}
+
+fn decode_sparse_alphabet_block(block: &SparseAlphabetBlock) -> Result<Vec<u8>, String> {
+    let original_len = block.original_len as usize;
+    let exception_positions = decode_position_deltas(&block.exception_positions)?;
+    let exception_count = exception_positions.len();
+    if exception_count > original_len {
+        return Err("sparse alphabet exception count exceeds block length".to_string());
+    }
+    let exception_indices = unpack_indices(
+        &block.exception_indices,
+        bit_width_for_cardinality(block.exception_alphabet.len()),
+        exception_count,
+    )?;
+    let dense_count = original_len
+        .checked_sub(exception_count)
+        .ok_or_else(|| "sparse alphabet dense count underflow".to_string())?;
+    let dense_indices =
+        unpack_indices(&block.dense_breadcrumbs, block.dense_bit_width, dense_count)?;
+
+    let exception_map = exception_positions
+        .into_iter()
+        .zip(exception_indices)
+        .map(|(position, index)| {
+            let byte = *block
+                .exception_alphabet
+                .get(index as usize)
+                .ok_or_else(|| "sparse alphabet exception index is out of range".to_string())?;
+            Ok((position, byte))
+        })
+        .collect::<Result<BTreeMap<_, _>, String>>()?;
+
+    let mut dense_cursor = 0_usize;
+    let mut out = Vec::with_capacity(original_len);
+    for position in 0..original_len {
+        if let Some(byte) = exception_map.get(&position).copied() {
+            out.push(byte);
+        } else {
+            let index = *dense_indices
+                .get(dense_cursor)
+                .ok_or_else(|| "dense sparse-alphabet stream is truncated".to_string())?;
+            dense_cursor += 1;
+            out.push(
+                *block
+                    .dense_alphabet
+                    .get(index as usize)
+                    .ok_or_else(|| "dense sparse-alphabet index is out of range".to_string())?,
+            );
+        }
     }
     Ok(out)
 }
@@ -1213,6 +1377,39 @@ fn decode_uleb128(bytes: &[u8], cursor: &mut usize) -> Result<u64, String> {
     }
 }
 
+fn encode_position_deltas(positions: &[usize]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut previous = None;
+    for position in positions {
+        let delta = match previous {
+            None => position + 1,
+            Some(last) => position - last,
+        };
+        encode_uleb128(delta as u64, &mut out);
+        previous = Some(*position);
+    }
+    out
+}
+
+fn decode_position_deltas(bytes: &[u8]) -> Result<Vec<usize>, String> {
+    let mut cursor = 0_usize;
+    let mut previous = None;
+    let mut positions = Vec::new();
+    while cursor < bytes.len() {
+        let delta = decode_uleb128(bytes, &mut cursor)?;
+        if delta == 0 {
+            return Err("position delta must be positive".to_string());
+        }
+        let position = match previous {
+            None => delta as usize - 1,
+            Some(last) => last + delta as usize,
+        };
+        positions.push(position);
+        previous = Some(position);
+    }
+    Ok(positions)
+}
+
 fn extract_trajectory_block(block: &BlockEncoding) -> Option<&TrajectoryBlock> {
     match block {
         BlockEncoding::Trajectory(trajectory) => Some(trajectory),
@@ -1251,6 +1448,20 @@ fn encoded_size_of(block: &BlockEncoding) -> usize {
         BlockEncoding::Raw(raw) => 1 + 4 + 4 + raw.payload.len(),
         BlockEncoding::Alphabet(alpha) => {
             1 + 4 + 1 + 1 + alpha.alphabet.len() + 4 + alpha.breadcrumbs.len()
+        }
+        BlockEncoding::SparseAlphabet(alpha) => {
+            1 + 4
+                + 1
+                + 1
+                + alpha.dense_alphabet.len()
+                + 4
+                + alpha.dense_breadcrumbs.len()
+                + 1
+                + alpha.exception_alphabet.len()
+                + 4
+                + alpha.exception_indices.len()
+                + 4
+                + alpha.exception_positions.len()
         }
         BlockEncoding::Spectral(spectral) => {
             1 + 4 + 2 + spectral.key.len() + 4 + spectral.residual.len()
@@ -1306,6 +1517,21 @@ fn serialize_single_layer_archive(archive: &Archive) -> Result<Vec<u8>, String> 
                 out.extend_from_slice(&alpha.alphabet);
                 push_u32(&mut out, alpha.breadcrumbs.len() as u32);
                 out.extend_from_slice(&alpha.breadcrumbs);
+            }
+            BlockEncoding::SparseAlphabet(alpha) => {
+                out.push(block.mode() as u8);
+                push_u32(&mut out, alpha.original_len);
+                out.push(alpha.dense_alphabet.len() as u8);
+                out.push(alpha.dense_bit_width);
+                out.extend_from_slice(&alpha.dense_alphabet);
+                push_u32(&mut out, alpha.dense_breadcrumbs.len() as u32);
+                out.extend_from_slice(&alpha.dense_breadcrumbs);
+                out.push(alpha.exception_alphabet.len() as u8);
+                out.extend_from_slice(&alpha.exception_alphabet);
+                push_u32(&mut out, alpha.exception_indices.len() as u32);
+                out.extend_from_slice(&alpha.exception_indices);
+                push_u32(&mut out, alpha.exception_positions.len() as u32);
+                out.extend_from_slice(&alpha.exception_positions);
             }
             BlockEncoding::Spectral(spectral) => {
                 out.push(block.mode() as u8);
@@ -1423,6 +1649,65 @@ fn parse_archive(input: &[u8]) -> Result<Archive, String> {
                     alphabet,
                     bit_width,
                     breadcrumbs,
+                }));
+            }
+            5 => {
+                let dense_alphabet_len = read_u8(input, &mut cursor)? as usize;
+                let dense_bit_width = read_u8(input, &mut cursor)?;
+                let dense_alphabet = read_vec(input, &mut cursor, dense_alphabet_len)?;
+                validate_alphabet(&dense_alphabet, dense_bit_width)?;
+                let dense_breadcrumbs_len = read_u32(input, &mut cursor)? as usize;
+                let dense_breadcrumbs = read_vec(input, &mut cursor, dense_breadcrumbs_len)?;
+                let exception_alphabet_len = read_u8(input, &mut cursor)? as usize;
+                let exception_alphabet = read_vec(input, &mut cursor, exception_alphabet_len)?;
+                validate_alphabet(
+                    &exception_alphabet,
+                    bit_width_for_cardinality(exception_alphabet.len()),
+                )?;
+                let exception_indices_len = read_u32(input, &mut cursor)? as usize;
+                let exception_indices = read_vec(input, &mut cursor, exception_indices_len)?;
+                let exception_positions_len = read_u32(input, &mut cursor)? as usize;
+                let exception_positions = read_vec(input, &mut cursor, exception_positions_len)?;
+                let positions = decode_position_deltas(&exception_positions)?;
+                if positions
+                    .iter()
+                    .any(|position| *position >= original_len as usize)
+                {
+                    return Err(
+                        "sparse alphabet exception position is outside the block".to_string()
+                    );
+                }
+                let exception_count = positions.len();
+                let dense_count = (original_len as usize)
+                    .checked_sub(exception_count)
+                    .ok_or_else(|| "sparse alphabet dense count underflow".to_string())?;
+                let expected_dense_bytes =
+                    ceil_div_u64(dense_count as u64 * dense_bit_width as u64, 8) as usize;
+                if dense_breadcrumbs.len() != expected_dense_bytes {
+                    return Err(
+                        "sparse alphabet dense breadcrumb payload length is not canonical"
+                            .to_string(),
+                    );
+                }
+                let expected_exception_index_bytes = ceil_div_u64(
+                    exception_count as u64
+                        * bit_width_for_cardinality(exception_alphabet.len()) as u64,
+                    8,
+                ) as usize;
+                if exception_indices.len() != expected_exception_index_bytes {
+                    return Err(
+                        "sparse alphabet exception index payload length is not canonical"
+                            .to_string(),
+                    );
+                }
+                blocks.push(BlockEncoding::SparseAlphabet(SparseAlphabetBlock {
+                    original_len,
+                    dense_alphabet,
+                    dense_bit_width,
+                    dense_breadcrumbs,
+                    exception_alphabet,
+                    exception_indices,
+                    exception_positions,
                 }));
             }
             1 => {
@@ -1751,6 +2036,32 @@ mod compact_codec_tests {
             let packed = compress_bytes(&input, Some(512)).unwrap();
             assert_eq!(decompress_bytes(&packed).unwrap(), input);
         }
+    }
+
+    #[test]
+    fn sparse_alphabet_factors_rare_symbols_out_of_a_dense_core() {
+        let core = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/".repeat(32);
+        let mut input = Vec::new();
+        for chunk in core.chunks(64) {
+            input.extend_from_slice(chunk);
+            input.push(b'\n');
+        }
+        let analysis = super::analyze_block(&input);
+        let sparse = match super::try_encode_sparse_alphabet_block(&input, &analysis).unwrap() {
+            Some(BlockEncoding::SparseAlphabet(block)) => block,
+            other => panic!("expected sparse alphabet block, got {other:?}"),
+        };
+        let plain = match super::try_encode_alphabet_block(&input, &analysis).unwrap() {
+            Some(block) => block,
+            None => panic!("expected plain alphabet candidate"),
+        };
+        assert!(sparse.exception_alphabet.contains(&b'\n'));
+        assert_eq!(super::decode_sparse_alphabet_block(&sparse).unwrap(), input);
+        assert!(encoded_size_of(&BlockEncoding::SparseAlphabet(sparse.clone())) < input.len());
+        assert!(
+            encoded_size_of(&BlockEncoding::SparseAlphabet(sparse.clone()))
+                < encoded_size_of(&plain)
+        );
     }
 
     #[test]

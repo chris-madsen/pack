@@ -1,6 +1,6 @@
 # `pack` Contract Test Matrix
 
-**Status:** 53 tests
+**Status:** 60 tests
 **Command:** `cargo test`
 
 | Area | Contract | Main tests |
@@ -9,13 +9,14 @@
 | Spectral packing | Coordinates, signs, amplitudes, count, block size, and tie bit roundtrip through one constant | `magic_constant_roundtrips_the_complete_spectral_program` |
 | Real spectral encode | Both block selection and the serialized archive path can emit and decode `BlockEncoding::Spectral`; known Walsh data produces an empty exception stream | `real_encode_path_emits_spectral_for_a_known_walsh_signal`, `public_archive_path_serializes_and_decodes_a_real_spectral_block` |
 | Spectral generation | Predictor expands weighted Walsh bases without PRNG state | `spectral_program_expands_a_walsh_basis_without_prng_state`, `spectral_magic_constant_expands_the_recorded_walsh_coordinates` |
-| Spectral `V` | Increasing exception addresses use canonical delta ULEB128 and restore the exact block | `spectral_exception_stream_is_canonical_and_lossless` |
-| Shared base | Equal roots generate equal executable schedules; schedules invert exactly | base module tests |
-| Topology compiler | Walsh, shift, derivative, popcount, and full-block fingerprint affect the operator root | topology module tests |
+| Spectral `V` | Exception stream chooses canonical sparse delta-ULEB128 or dense bitmap form and restores the exact block | `spectral_exception_stream_is_canonical_and_lossless`, `dense_spectral_residual_is_used_when_sparse_deltas_are_worse` |
+| Shared base | Equal roots generate equal executable schedules; schedules invert exactly; schedule selection is structural rather than roulette | base module tests |
+| Topology compiler | Walsh, shift, derivative, popcount, and full-block fingerprint affect the typed operator blueprint | topology module tests, `operator_key_exposes_structural_topology_fields` |
 | Feistel/ARX | Forward/inverse roundtrip; odd multipliers; nonlinear round internals remain reversible through Feistel | reversible module tests |
 | Real binary `U_K` | Exact butterfly/phase conjugation is an involution and is used by operator codec | `binary_u_k_is_an_exact_involution_for_word_codec`, `operator_k_is_one_constant_and_u_k_is_an_involution` |
-| Operator economics | Operator candidate is forbidden unless transformed parity is strictly shorter than direct parity | `operator_is_never_accepted_without_strictly_shorter_parity_trajectory` |
-| Operator `V` | Terminal, step count, and parity stream restore the exact source word | `operator_wire_format_roundtrips_terminal_steps_and_parity` |
+| Grouped trajectory economics | Trajectory/operator paths are scored by grouped terminal palettes plus parity cost, not by a fake “single terminal miracle” | `operator_is_never_accepted_without_strictly_shorter_parity_trajectory`, `operator_search_never_returns_a_key_worse_than_the_structural_seed` |
+| Operator/trajectory `V` | Terminal palettes, packed terminal indices, step count, and parity stream restore the exact source words | `operator_wire_format_roundtrips_terminal_palette_steps_and_parity` |
+| Sparse alphabet factoring | Rare symbols can be lifted into sparse positions while the dense core alphabet is packed at lower width | `sparse_alphabet_factors_rare_symbols_out_of_a_dense_core` |
 | Budget | Exact `K/V/overhead` accounting; fixed 64-bit key limit; any strict gain is accepted | budget module tests |
 | Container | Lossless roundtrip, recursive shrinking, version/trailing/raw validation | compact codec tests |
 

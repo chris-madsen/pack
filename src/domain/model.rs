@@ -5,6 +5,7 @@ pub enum BlockMode {
     AlphabetBreadcrumbs = 2,
     Trajectory = 3,
     Operator = 4,
+    SparseAlphabet = 5,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -34,6 +35,17 @@ pub struct AlphabetBlock {
     pub alphabet: Vec<u8>,
     pub bit_width: u8,
     pub breadcrumbs: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SparseAlphabetBlock {
+    pub original_len: u32,
+    pub dense_alphabet: Vec<u8>,
+    pub dense_bit_width: u8,
+    pub dense_breadcrumbs: Vec<u8>,
+    pub exception_alphabet: Vec<u8>,
+    pub exception_indices: Vec<u8>,
+    pub exception_positions: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -67,6 +79,7 @@ pub struct OperatorBlock {
 pub enum BlockEncoding {
     Raw(RawBlock),
     Alphabet(AlphabetBlock),
+    SparseAlphabet(SparseAlphabetBlock),
     Spectral(SpectralBlock),
     Trajectory(TrajectoryBlock),
     Operator(OperatorBlock),
@@ -77,6 +90,7 @@ impl BlockEncoding {
         match self {
             Self::Raw(_) => BlockMode::Raw,
             Self::Alphabet(_) => BlockMode::AlphabetBreadcrumbs,
+            Self::SparseAlphabet(_) => BlockMode::SparseAlphabet,
             Self::Spectral(_) => BlockMode::Spectral,
             Self::Trajectory(_) => BlockMode::Trajectory,
             Self::Operator(_) => BlockMode::Operator,
