@@ -1,4 +1,6 @@
-use crate::domain::kernel::key::{MagicKey, SpectralPeakCode, SpectralProgram, MAX_SPECTRAL_PEAKS};
+use crate::domain::kernel::key::{
+    MagicKey, OperatorBlueprint, SpectralPeakCode, SpectralProgram, MAX_SPECTRAL_PEAKS,
+};
 use crate::domain::kernel::spectral::{normalized_fwht, strongest_walsh_peaks, SpectralPeak};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -130,55 +132,50 @@ pub fn compile_topology_to_key(signature: &TopologySignature) -> Result<MagicKey
         return Err("signature lacks required topology features".to_string());
     }
 
-    let derivative_fold =
-        signature
-            .derivative
-            .chunks(64)
-            .enumerate()
-            .fold(0_u64, |state, (chunk_index, chunk)| {
-                let word = chunk
-                    .iter()
-                    .enumerate()
-                    .fold(0_u64, |word, (bit, value)| word | ((*value as u64) << bit));
-                avalanche(state ^ word.rotate_left((chunk_index % 64) as u32))
-            });
-    let popcnt_fold = signature
+    let dominant = &signature.walsh_peaks[0];
+    let second = signature.walsh_peaks.get(1).unwrap_or(dominant);
+    let third = signature.walsh_peaks.get(2).unwrap_or(dominant);
+    let shift = &signature.shift_scores[0];
+    let derivative_density = quantize_ratio(
+        signature.derivative.iter().filter(|bit| **bit == 1).count(),
+        signature.derivative.len(),
+        8,
+    );
+    let derivative_signature =
+        (derivative_density & !1) | u64::from(*signature.derivative.first().unwrap_or(&0));
+    let popcnt_sum = signature
         .popcnt_profile
         .iter()
-        .enumerate()
-        .fold(0_u64, |state, (index, count)| {
-            state ^ (*count as u64).rotate_left((index % 64) as u32)
-        });
-    let shift_fold =
-        signature
-            .shift_scores
-            .iter()
-            .enumerate()
-            .fold(0_u64, |state, (rank, score)| {
-                state
-                    ^ (score.shift as u64).rotate_left((rank * 11) as u32)
-                    ^ (score.matching_bits as u64).rotate_right((rank * 7) as u32)
-            });
-    let peak_fold = signature
-        .walsh_peaks
-        .iter()
-        .enumerate()
-        .fold(0_u64, |state, (rank, peak)| {
-            let signed_index = (peak.index as u64)
-                ^ if peak.coefficient.is_sign_negative() {
-                    u64::MAX
-                } else {
-                    0
-                };
-            state ^ signed_index.rotate_left((rank * 13) as u32)
-        });
-    Ok(MagicKey::from_raw(avalanche(
-        signature.fingerprint
-            ^ derivative_fold.rotate_left(7)
-            ^ popcnt_fold.rotate_left(19)
-            ^ shift_fold.rotate_left(31)
-            ^ peak_fold,
-    )))
+        .map(|count| *count as usize)
+        .sum::<usize>();
+    let popcnt_capacity = signature.popcnt_profile.len().saturating_mul(64);
+    let popcnt_density = quantize_ratio(popcnt_sum, popcnt_capacity.max(1), 8);
+    let popcnt_signature = (popcnt_density & !0x0F)
+        | u64::from(signature.popcnt_profile.first().copied().unwrap_or(0) & 0x0F);
+    let shift_match = quantize_ratio(shift.matching_bits, signature.bit_len, 9);
+    let secondary_delta = ((second.index ^ dominant.index) & 0x1F) as u8;
+    let tertiary_delta = ((third.index ^ dominant.index) & 0x1F) as u8;
+    let fingerprint_bias = (signature.fingerprint & 0x1F) as u8;
+
+    MagicKey::from_operator_blueprint(&OperatorBlueprint {
+        dominant_index: dominant.index as u16,
+        dominant_positive: !dominant.coefficient.is_sign_negative(),
+        primary_shift: shift.shift as u8,
+        shift_match: shift_match as u16,
+        derivative_density: derivative_signature as u8,
+        popcnt_density: popcnt_signature as u8,
+        secondary_delta,
+        tertiary_delta,
+        fingerprint_bias,
+    })
+}
+
+fn quantize_ratio(numerator: usize, denominator: usize, bits: u8) -> u64 {
+    if denominator == 0 {
+        return 0;
+    }
+    let max = (1_u64 << bits) - 1;
+    ((numerator as u128 * max as u128 + (denominator as u128 / 2)) / denominator as u128) as u64
 }
 
 pub fn compile_spectral_key(signature: &TopologySignature) -> Result<MagicKey, String> {
@@ -233,7 +230,7 @@ fn avalanche(mut value: u64) -> u64 {
 mod tests {
     use super::{
         analyze_topology, block_fingerprint, circular_bit_derivative, compile_spectral_key,
-        compile_topology_to_key, popcnt_profile, shift_correlation,
+        compile_topology_to_key, popcnt_profile, shift_correlation, MAX_SPECTRAL_PEAKS,
     };
 
     #[test]
@@ -269,8 +266,9 @@ mod tests {
         let second = compile_topology_to_key(&signature).unwrap();
         assert_eq!(first, second);
 
-        assert_eq!(first.bit_len(), 64);
+        assert_eq!(first.encoded_bit_len(), 64);
         assert_ne!(first.raw(), 0);
+        assert!(first.spectral_program().is_err());
 
         let spectral = compile_spectral_key(&signature).unwrap();
         let program = spectral.spectral_program().unwrap();
@@ -282,7 +280,7 @@ mod tests {
                 .iter()
                 .filter(|peak| peak.coefficient.abs() > 1e-12)
                 .count()
-                .min(4)
+                .min(MAX_SPECTRAL_PEAKS)
         );
         assert_eq!(spectral.serialize().len(), 8);
     }
@@ -292,6 +290,29 @@ mod tests {
         let left = compile_topology_to_key(&analyze_topology(&[0xAA; 64]).unwrap()).unwrap();
         let right = compile_topology_to_key(&analyze_topology(&[0xF0; 64]).unwrap()).unwrap();
         assert_ne!(left.serialize(), right.serialize());
+    }
+
+    #[test]
+    fn operator_key_exposes_structural_topology_fields() {
+        let signature = analyze_topology(&[0xA5; 64]).unwrap();
+        let key = compile_topology_to_key(&signature).unwrap();
+        let blueprint = key.operator_blueprint().unwrap();
+        assert_eq!(
+            usize::from(blueprint.dominant_index),
+            signature.walsh_peaks[0].index
+        );
+        assert_eq!(
+            blueprint.dominant_positive,
+            !signature.walsh_peaks[0].coefficient.is_sign_negative()
+        );
+        assert_eq!(
+            usize::from(blueprint.primary_shift),
+            signature.shift_scores[0].shift
+        );
+        assert_eq!(
+            blueprint.fingerprint_bias,
+            (signature.fingerprint & 0x1F) as u8
+        );
     }
 
     #[test]
@@ -307,7 +328,11 @@ mod tests {
         );
 
         let mut changed = signature.clone();
-        changed.shift_scores[0].shift = changed.shift_scores[0].shift % 31 + 1;
+        changed.shift_scores[0].shift = if changed.shift_scores[0].shift == 32 {
+            31
+        } else {
+            changed.shift_scores[0].shift + 1
+        };
         assert_ne!(
             compile_topology_to_key(&changed).unwrap().serialize(),
             baseline

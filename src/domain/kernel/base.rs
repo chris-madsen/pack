@@ -224,14 +224,17 @@ pub fn generate_base_from_root(
         return Err("standard base does not contain reversible operations".to_string());
     }
 
-    let mut state = root.value | 1;
+    let mut available = reversible;
     let mut operation_schedule = Vec::with_capacity(8);
-    for round in 0..8_u32 {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state = state.rotate_left((round % 31) + 1);
-        let index = (state as usize) % reversible.len();
-        operation_schedule.push(reversible[index]);
+    let mut rank = root.value % permutation_prefix_capacity(available.len(), 8);
+    for round in 0..8 {
+        let remaining = available.len() as u64;
+        let index = (rank % remaining) as usize;
+        rank /= remaining;
+        operation_schedule.push(available.remove(index));
+        if round == 7 {
+            break;
+        }
     }
 
     Ok(GeneratedBase {
@@ -241,19 +244,19 @@ pub fn generate_base_from_root(
     })
 }
 
-fn round_constant(root: RootSeed, round: usize) -> u64 {
-    let mixed = root
-        .value
-        .wrapping_add((round as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15));
-    avalanche(mixed)
+fn permutation_prefix_capacity(choices: usize, picks: usize) -> u64 {
+    let mut capacity = 1_u64;
+    for remaining in 0..picks {
+        capacity = capacity.saturating_mul((choices - remaining) as u64);
+    }
+    capacity.max(1)
 }
 
-fn avalanche(mut value: u64) -> u64 {
-    value ^= value >> 30;
-    value = value.wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    value ^= value >> 27;
-    value = value.wrapping_mul(0x94D0_49BB_1331_11EB);
-    value ^ (value >> 31)
+fn round_constant(root: RootSeed, round: usize) -> u64 {
+    let left = root.value.rotate_left(((round * 11 + 5) % 64) as u32);
+    let right = root.value.rotate_right(((round * 7 + 3) % 64) as u32);
+    let stripe = u64::from_le_bytes([round as u8 + 1; 8]);
+    left ^ right ^ stripe ^ (stripe.rotate_left((round % 17) as u32))
 }
 
 fn apply_operation(value: u64, operation: OperationCode, parameter: u64) -> Result<u64, String> {
@@ -415,5 +418,19 @@ mod tests {
             left.apply_forward(value).unwrap(),
             right.apply_forward(value).unwrap()
         );
+    }
+
+    #[test]
+    fn generated_schedule_uses_distinct_reversible_operations() {
+        let base = standard_base(1).unwrap();
+        for root in [0, 1, 2, 0xDEAD_BEEF_CAFE_BABE] {
+            let generated = generate_base_from_root(&base, RootSeed { value: root }).unwrap();
+            let unique = generated
+                .operation_schedule
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(unique.len(), generated.operation_schedule.len());
+        }
     }
 }
