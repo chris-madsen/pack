@@ -31,6 +31,10 @@ const RECURSIVE_HEADER_BYTES: usize = 27;
 const LAYER_SUMMARY_BYTES: usize = 18;
 const MIN_WINDOW_BYTES: usize = 16;
 const MAX_WINDOW_BYTES: usize = 2048;
+/// Byte length of the PACKMVP1 single-layer archive header:
+/// magic(8) + version(1) + window_min_exp(1) + window_max_exp(1)
+/// + original_size(8) + block_count(4) = 23 bytes.
+const SINGLE_LAYER_HEADER_BYTES: usize = 23;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CompressionProfile {
@@ -202,11 +206,18 @@ pub fn decompress_bytes(input: &[u8]) -> Result<Vec<u8>, String> {
 pub fn inspect_archive(input: &[u8]) -> Result<Vec<LayerSummary>, String> {
     if input.starts_with(MAGIC_SINGLE) {
         let archive = parse_archive(input)?;
+        // output_size is the compressed payload size (archive blob minus the
+        // fixed 23-byte PACKMVP1 header).  This is consistent with the
+        // multi-layer format where output_size tracks the compressed data
+        // bytes, not the full framed archive.
+        let payload_size = input
+            .len()
+            .saturating_sub(SINGLE_LAYER_HEADER_BYTES) as u64;
         return Ok(vec![LayerSummary {
             window_min_bits: 1_u32 << archive.header.window_min_exp,
             window_max_bits: 1_u32 << archive.header.window_max_exp,
             input_size: archive.header.original_size,
-            output_size: input.len() as u64,
+            output_size: payload_size,
         }]);
     }
     parse_recursive_archive(input).map(|archive| archive.layer_summaries)
@@ -347,14 +358,19 @@ fn select_block_window(input: &[u8], sizes: &[usize]) -> Result<(u8, usize), Str
     ))
 }
 
+/// Score a topology signature for window-size selection.
+/// Returns 0.0 for degenerate inputs (empty walsh_peaks) rather than panicking.
 fn topology_score(signature: &TopologySignature) -> f64 {
+    let Some(peak0) = signature.walsh_peaks.first() else {
+        return 0.0;
+    };
     let peak_sum = signature
         .walsh_peaks
         .iter()
         .map(|peak| peak.coefficient.unsigned_abs() as f64)
         .sum::<f64>()
         .max(1e-12);
-    let prominence = signature.walsh_peaks[0].coefficient.unsigned_abs() as f64 / peak_sum;
+    let prominence = peak0.coefficient.unsigned_abs() as f64 / peak_sum;
     let derivative_density = signature.derivative.iter().filter(|bit| **bit == 1).count() as f64
         / signature.derivative.len().max(1) as f64;
     let shift_coherence = signature
@@ -543,7 +559,10 @@ fn try_encode_alphabet_block(
     }
 
     let bit_width = bit_width_for_cardinality(alphabet.len());
-    if bit_width >= 8 {
+    // bit_width == 0 means alphabet has exactly one symbol.  pack_indices is
+    // safe at width=0 (returns an empty vec) but the encoding carries no
+    // information and can never beat a Raw block — skip it explicitly.
+    if bit_width == 0 || bit_width >= 8 {
         return Ok(None);
     }
 
@@ -1685,11 +1704,15 @@ mod compact_codec_tests {
         analyze_pass_band, compress_bytes, compress_bytes_generator_only_strict,
         compress_bytes_with_outcome, compress_single_layer_bytes, decode_operator_block,
         decompress_bytes, encoded_size_of, inspect_archive, parse_archive,
-        serialize_single_layer_archive, try_encode_operator_block, Archive, ArchiveHeader,
-        BlockEncoding, BlockRecord, OperatorBlock, PassWindowBand, RawBlock, MAGIC_MULTI,
+        serialize_single_layer_archive, topology_score, try_encode_alphabet_block,
+        try_encode_operator_block, analyze_block, Archive, ArchiveHeader, BlockEncoding,
+        BlockRecord, OperatorBlock, PassWindowBand, RawBlock, MAGIC_MULTI,
+        SINGLE_LAYER_HEADER_BYTES,
     };
     use crate::domain::kernel::operator::{contract_block, expand_block, materialize_runtime};
-    use crate::domain::kernel::topology::{analyze_topology, compile_topology_to_constant};
+    use crate::domain::kernel::topology::{
+        analyze_topology, compile_topology_to_constant, TopologySignature, WalshPeak, ShiftScore,
+    };
 
     #[test]
     fn roundtrip_ascii_and_binary_data() {
@@ -1725,6 +1748,8 @@ mod compact_codec_tests {
             .all(|pair| pair[0].output_size == pair[1].input_size));
     }
 
+    /// inspect_archive output_size is the payload bytes (archive minus header),
+    /// not the full archive blob.  Verify against SINGLE_LAYER_HEADER_BYTES.
     #[test]
     fn inspect_archive_reports_real_input_size_and_window_band_for_single_layer_archives() {
         let input = b"0123456789".repeat(200);
@@ -1739,7 +1764,10 @@ mod compact_codec_tests {
         let layers = inspect_archive(&packed).unwrap();
         assert_eq!(layers.len(), 1);
         assert_eq!(layers[0].input_size, input.len() as u64);
-        assert_eq!(layers[0].output_size, packed.len() as u64);
+        assert_eq!(
+            layers[0].output_size,
+            (packed.len() - SINGLE_LAYER_HEADER_BYTES) as u64
+        );
         assert_eq!(layers[0].window_min_bits, 1024);
         assert_eq!(layers[0].window_max_bits, 4096);
     }
@@ -1872,7 +1900,7 @@ mod compact_codec_tests {
                 }],
             };
             let wire = serialize_single_layer_archive(&archive).unwrap();
-            let header_len = 8 + 1 + 1 + 1 + 8 + 4;
+            let header_len = SINGLE_LAYER_HEADER_BYTES;
             assert_eq!(encoded_size_of(&block), wire.len() - header_len);
         }
     }
@@ -1926,5 +1954,75 @@ mod compact_codec_tests {
         .unwrap();
         let layers = inspect_archive(&compressed).unwrap();
         assert_eq!(layers[0].input_size, input.len() as u64);
+        assert_eq!(
+            layers[0].output_size,
+            (compressed.len() - SINGLE_LAYER_HEADER_BYTES) as u64
+        );
+    }
+
+    /// topology_score must not panic when walsh_peaks is empty.
+    /// This is reachable for all-zero blocks after FWHT.
+    #[test]
+    fn topology_score_returns_zero_for_empty_walsh_peaks() {
+        let sig = TopologySignature {
+            bit_len: 64,
+            walsh_peaks: vec![],
+            shift_scores: vec![],
+            derivative: vec![0u8; 64],
+            popcnt_profile: vec![0u8; 8],
+        };
+        assert_eq!(topology_score(&sig), 0.0);
+    }
+
+    /// topology_score must not panic on white-noise input either.
+    #[test]
+    fn topology_score_does_not_panic_on_white_noise() {
+        let mut state: u64 = 0xC0FFEE_DEAD_BEEF;
+        let input: Vec<u8> = (0..128)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state & 0xFF) as u8
+            })
+            .collect();
+        let sig = crate::domain::kernel::topology::analyze_topology(&input).unwrap();
+        let score = topology_score(&sig);
+        assert!(score.is_finite(), "topology_score must be finite for white noise");
+    }
+
+    /// Alphabet encoding must return None for a single-symbol alphabet (bit_width == 0).
+    #[test]
+    fn alphabet_bit_width_zero_returns_none() {
+        let input = vec![0xAAu8; 256];
+        let analysis = analyze_block(&input);
+        let result = try_encode_alphabet_block(&input, &analysis).unwrap();
+        assert!(
+            result.is_none(),
+            "single-symbol alphabet must not produce an Alphabet encoding"
+        );
+    }
+
+    /// WHITE NOISE: full compress→decompress roundtrip on 4 KB of xorshift data.
+    #[test]
+    fn white_noise_4kb_roundtrip() {
+        let mut state: u64 = 0x0123_4567_89AB_CDEF;
+        let input: Vec<u8> = (0..4096)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state & 0xFF) as u8
+            })
+            .collect();
+        let compressed = compress_bytes(&input, None).unwrap();
+        let restored = decompress_bytes(&compressed).unwrap();
+        assert_eq!(restored, input, "roundtrip failed for 4 KB white noise");
+        assert!(
+            compressed.len() >= input.len().saturating_sub(64),
+            "white noise compressed suspiciously: {} -> {} bytes",
+            input.len(),
+            compressed.len()
+        );
     }
 }
