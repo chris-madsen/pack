@@ -9,15 +9,17 @@ use crate::domain::kernel::spectral::{normalized_fwht, strongest_walsh_peaks};
 // ── Public types ─────────────────────────────────────────────────────────────
 
 /// Cached result of the O(n log n) Walsh transform + derived statistics.
-/// Computed once per block in `encode_block` and threaded through all encoders.
+/// Computed once per block and threaded through all encoders.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TopologySignature {
+    /// Length of the block in bits (= block.len() * 8).
+    /// Must be a non-zero power of two.
+    pub bit_len: usize,
     /// Top Walsh peaks sorted by |coefficient|, strongest first.
     pub walsh_peaks: Vec<WalshPeak>,
-    /// Per-shift XOR-spread scores, used to pick `primary_shift`.
-    /// `shift_scores[k]` = quality score for shift amount k+1.
+    /// Per-shift XOR-spread scores (32 entries, shift k → index k-1).
     pub shift_scores: Vec<u8>,
-    /// 48-bit fingerprint: XOR-fold of block bytes for trajectory key seeding.
+    /// 48-bit XOR-fold fingerprint for trajectory key seeding.
     pub fingerprint: u64,
 }
 
@@ -54,14 +56,13 @@ pub fn analyze_topology(block: &[u8]) -> Result<TopologySignature, String> {
         .map(|p| WalshPeak { index: p.index, coefficient: p.coefficient })
         .collect();
 
-    // Shift scores: for shift k+1, score = popcount spread heuristic
+    // Shift scores: for shift k+1, score = XOR-spread heuristic
     let shift_scores: Vec<u8> = (1_u8..=32).map(|shift| {
         let spread: u64 = block
             .iter()
             .zip(block.iter().cycle().skip(shift as usize))
             .map(|(&a, &b)| u64::from((a ^ b).count_ones() as u8))
             .sum();
-        // Normalise into 0..=255
         (spread.min(255 * block.len() as u64) / block.len().max(1) as u64) as u8
     }).collect();
 
@@ -77,13 +78,12 @@ pub fn analyze_topology(block: &[u8]) -> Result<TopologySignature, String> {
         })
         & 0x0000_FFFF_FFFF_FFFF;
 
-    Ok(TopologySignature { walsh_peaks, shift_scores, fingerprint })
+    Ok(TopologySignature { bit_len, walsh_peaks, shift_scores, fingerprint })
 }
 
 // ── Key compilers ─────────────────────────────────────────────────────────────
 
 /// Derive an `OperatorBlueprint`-tagged `MagicKey` from a `TopologySignature`.
-/// Called by the operator encoder path.
 pub fn compile_topology_to_key(sig: &TopologySignature) -> Result<MagicKey, String> {
     if sig.walsh_peaks.is_empty() {
         return Err("compile_topology_to_key: signature has no Walsh peaks".to_string());
@@ -120,23 +120,21 @@ pub fn compile_topology_to_key(sig: &TopologySignature) -> Result<MagicKey, Stri
 }
 
 /// Derive a `Spectral`-tagged `MagicKey` from a `TopologySignature`.
-/// Called by the spectral encoder path.
+///
+/// Uses `sig.bit_len` as the authoritative block size so that uniform blocks
+/// (whose only Walsh peak is the DC component at index 0) produce a correct key.
 pub fn compile_spectral_key(sig: &TopologySignature) -> Result<MagicKey, String> {
     if sig.walsh_peaks.is_empty() {
         return Err("compile_spectral_key: signature has no Walsh peaks".to_string());
     }
 
-    // Determine bit_len from fingerprint / peaks — we need it to build the program.
-    // Caller guarantees block length is known; we recover log2 from shift_scores length.
-    // shift_scores has 32 entries always; bit_len is block.len()*8.
-    // We embed it via the peak indices directly (they are < bit_len by construction).
-    let bit_len_log2 = {
-        // The largest peak index gives a lower bound; we round up to next power of two.
-        let max_idx = sig.walsh_peaks.iter().map(|p| p.index).max().unwrap_or(0);
-        let lower = (max_idx + 1).next_power_of_two().max(8);
-        lower.ilog2() as usize
-    };
-    let bit_len = 1_usize << bit_len_log2;
+    // Use the authoritative bit_len from the signature, not a guess from peak indices.
+    let bit_len = sig.bit_len;
+    if bit_len == 0 || !bit_len.is_power_of_two() {
+        return Err(format!(
+            "compile_spectral_key: invalid bit_len {bit_len}"
+        ));
+    }
 
     let peaks: Vec<SpectralPeakCode> = sig.walsh_peaks
         .iter()
@@ -153,8 +151,7 @@ pub fn compile_spectral_key(sig: &TopologySignature) -> Result<MagicKey, String>
     MagicKey::from_spectral_program(&SpectralProgram { bit_len, peaks, tie_bit })
 }
 
-/// Derive a `Trajectory`-tagged `MagicKey` from a raw block.
-/// (Block fingerprint + step count.)
+/// Compute a 48-bit XOR-fold fingerprint of `block` for trajectory key seeding.
 pub fn block_fingerprint(block: &[u8]) -> Result<u64, String> {
     if block.is_empty() {
         return Err("block_fingerprint: empty block".to_string());
@@ -177,10 +174,6 @@ mod tests {
     use super::*;
     use crate::domain::kernel::key::MagicKeyKind;
 
-    fn uniform_block(byte: u8, len: usize) -> Vec<u8> {
-        vec![byte; len]
-    }
-
     fn sequential_block(len: usize) -> Vec<u8> {
         (0..len).map(|i| i as u8).collect()
     }
@@ -200,6 +193,14 @@ mod tests {
     }
 
     #[test]
+    fn topology_carries_correct_bit_len() {
+        for &len in &[8usize, 64, 512] {
+            let sig = analyze_topology(&sequential_block(len)).unwrap();
+            assert_eq!(sig.bit_len, len * 8, "bit_len wrong for block len={len}");
+        }
+    }
+
+    #[test]
     fn compile_topology_to_key_returns_operator_kind() {
         let block = sequential_block(64);
         let sig = analyze_topology(&block).unwrap();
@@ -213,6 +214,19 @@ mod tests {
         let sig = analyze_topology(&block).unwrap();
         let key = compile_spectral_key(&sig).unwrap();
         assert!(key.require_kind(MagicKeyKind::Spectral).is_ok());
+    }
+
+    #[test]
+    fn compile_spectral_key_uniform_block_uses_correct_bit_len() {
+        // Uniform block: DC-only Walsh peak at index 0.
+        // Without sig.bit_len the old code inferred bit_len=8 for any block size.
+        let block = vec![0xAAu8; 512]; // 4096 bits
+        let sig = analyze_topology(&block).unwrap();
+        assert_eq!(sig.bit_len, 4096);
+        let key = compile_spectral_key(&sig).unwrap();
+        // The spectral program must know bit_len=4096, not 8
+        let prog = key.spectral_program().unwrap();
+        assert_eq!(prog.bit_len, 4096, "spectral program bit_len must match block");
     }
 
     #[test]
