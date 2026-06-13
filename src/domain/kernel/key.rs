@@ -37,7 +37,7 @@ const OPERATOR_TERTIARY_DELTA_SHIFT: u64 =
 const OPERATOR_FINGERPRINT_BIAS_SHIFT: u64 =
     OPERATOR_TERTIARY_DELTA_SHIFT + OPERATOR_TERTIARY_DELTA_BITS;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct MagicKey(u64);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

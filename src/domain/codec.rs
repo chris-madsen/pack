@@ -17,6 +17,7 @@ use crate::domain::kernel::reversible::{
 use crate::domain::kernel::spectral::synthesise_spectral_bits;
 use crate::domain::kernel::topology::{
     analyze_topology, block_fingerprint, compile_spectral_key, compile_topology_to_key,
+    TopologySignature,
 };
 use crate::domain::kernel::trajectory::{
     decode_parity_trajectory, encode_parity_trajectory, ParityTrajectory,
@@ -111,9 +112,10 @@ pub fn decompress_bytes(input: &[u8]) -> Result<Vec<u8>, String> {
 
 pub fn inspect_archive(input: &[u8]) -> Result<Vec<LayerSummary>, String> {
     if input.starts_with(MAGIC_SINGLE) {
+        let archive = parse_archive(input)?;
         return Ok(vec![LayerSummary {
-            block_size_bytes: parse_archive(input)?.header.block_size_bytes,
-            input_size: 0,
+            block_size_bytes: archive.header.block_size_bytes,
+            input_size: archive.header.original_size,
             output_size: input.len() as u64,
         }]);
     }
@@ -592,7 +594,7 @@ fn try_encode_operator_block(block: &[u8]) -> Result<Option<BlockEncoding>, Stri
         .chunks_exact(8)
         .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
         .collect::<Vec<_>>();
-    let base_key = match search_operator_codec_key(block, &words) {
+    let base_key = match select_operator_codec_key_from_family(block, &words) {
         Ok(Some(key)) => key,
         Ok(None) | Err(_) => return Ok(None),
     };
@@ -934,7 +936,7 @@ fn decode_operator_block(block: &OperatorBlock) -> Result<Vec<u8>, String> {
             crumbs: word_crumbs.to_vec(),
         })?;
         let word =
-            apply_operator_word_u_k_with_runtime(transformed, &operator, &generated, &feistel)?;
+            invert_operator_word_u_k_with_runtime(transformed, &operator, &generated, &feistel)?;
         out.extend_from_slice(&word.to_le_bytes());
     }
     Ok(out)
@@ -945,48 +947,30 @@ fn build_trajectory_key(block: &[u8], steps: u8) -> Result<MagicKey, String> {
     MagicKey::from_trajectory_payload(fingerprint, steps)
 }
 
+#[cfg(test)]
 fn build_operator_codec_key(block: &[u8]) -> Result<MagicKey, String> {
     compile_topology_to_key(&analyze_topology(block)?)
 }
 
-fn search_operator_codec_key(block: &[u8], words: &[u64]) -> Result<Option<MagicKey>, String> {
-    let initial = build_operator_codec_key(block)?;
+fn select_operator_codec_key_from_family(
+    block: &[u8],
+    words: &[u64],
+) -> Result<Option<MagicKey>, String> {
+    let signature = analyze_topology(block)?;
     let original_score = grouped_trajectory_score(words)?;
-    let mut best = score_operator_key(words, initial)?;
-    let mut best_key = initial;
-
-    let mut starts = operator_search_starts(initial);
-    starts.insert(0, initial);
-    for start in starts {
-        let mut current = start;
-        let mut current_score = score_operator_key(words, current)?;
-        if is_better_operator_score(current_score, best) {
-            best = current_score;
-            best_key = current;
-        }
-
-        for round in 0..4 {
-            let mut improved = false;
-            for candidate in mutate_operator_key_fields(current, round) {
-                let score = score_operator_key(words, candidate)?;
-                if is_better_operator_score(score, current_score) {
-                    current = candidate;
-                    current_score = score;
-                    improved = true;
-                }
-                if is_better_operator_score(score, best) {
-                    best = score;
-                    best_key = candidate;
-                }
-            }
-            if !improved {
-                break;
-            }
+    let candidates = operator_candidate_family(&signature)?;
+    let mut best = None;
+    let mut best_key = None;
+    for candidate in candidates {
+        let score = score_operator_key(words, candidate)?;
+        if is_better_operator_score(score, best) {
+            best = score;
+            best_key = Some(candidate);
         }
     }
 
     if is_better_trajectory_score(best, original_score) {
-        Ok(Some(best_key))
+        Ok(best_key)
     } else {
         Ok(None)
     }
@@ -1008,93 +992,49 @@ fn is_better_operator_score(
     is_better_trajectory_score(candidate, incumbent)
 }
 
-fn operator_search_starts(initial: MagicKey) -> Vec<MagicKey> {
-    let Ok(blueprint) = initial.operator_blueprint() else {
-        return Vec::new();
-    };
-    let variants = [
-        OperatorBlueprint {
-            dominant_positive: !blueprint.dominant_positive,
-            ..blueprint
-        },
-        OperatorBlueprint {
-            primary_shift: (blueprint.primary_shift % 32) + 1,
-            ..blueprint
-        },
-        OperatorBlueprint {
-            secondary_delta: blueprint.tertiary_delta,
-            tertiary_delta: blueprint.secondary_delta,
-            ..blueprint
-        },
-        OperatorBlueprint {
-            fingerprint_bias: blueprint.fingerprint_bias ^ 0x1F,
-            ..blueprint
-        },
+fn operator_candidate_family(signature: &TopologySignature) -> Result<Vec<MagicKey>, String> {
+    let base = compile_topology_to_key(signature)?;
+    let base_blueprint = base.operator_blueprint()?;
+    let fallback_peak = signature.walsh_peaks.first();
+    let fallback_shift = signature.shift_scores.first();
+    let peak_pairs = [
+        (signature.walsh_peaks.first(), signature.walsh_peaks.get(1)),
+        (signature.walsh_peaks.first(), signature.walsh_peaks.get(2)),
+        (signature.walsh_peaks.get(1), signature.walsh_peaks.first()),
+        (signature.walsh_peaks.get(2), signature.walsh_peaks.first()),
     ];
-    variants
+    let variants = peak_pairs
         .into_iter()
-        .filter_map(|variant| MagicKey::from_operator_blueprint(&variant).ok())
-        .collect()
-}
-
-fn mutate_operator_key_fields(key: MagicKey, round: u8) -> Vec<MagicKey> {
-    let Ok(blueprint) = key.operator_blueprint() else {
-        return Vec::new();
-    };
-    let round_step = round as u16 + 1;
-    let variants = [
-        OperatorBlueprint {
-            dominant_index: ((usize::from(blueprint.dominant_index) + round_step as usize) % 8192)
-                as u16,
-            ..blueprint
-        },
-        OperatorBlueprint {
-            primary_shift: ((usize::from(blueprint.primary_shift) + round_step as usize - 1) % 32
-                + 1) as u8,
-            ..blueprint
-        },
-        OperatorBlueprint {
-            shift_match: blueprint.shift_match.wrapping_add(17 * round_step) & 0x1FF,
-            ..blueprint
-        },
-        OperatorBlueprint {
-            derivative_density: blueprint
-                .derivative_density
-                .wrapping_add((29 * round_step) as u8),
-            ..blueprint
-        },
-        OperatorBlueprint {
-            popcnt_density: blueprint
-                .popcnt_density
-                .wrapping_add((11 * round_step) as u8),
-            ..blueprint
-        },
-        OperatorBlueprint {
-            secondary_delta: blueprint
-                .secondary_delta
-                .wrapping_add((3 * round_step) as u8)
-                & 0x1F,
-            ..blueprint
-        },
-        OperatorBlueprint {
-            tertiary_delta: blueprint
-                .tertiary_delta
-                .wrapping_add((5 * round_step) as u8)
-                & 0x1F,
-            ..blueprint
-        },
-        OperatorBlueprint {
-            fingerprint_bias: blueprint
-                .fingerprint_bias
-                .wrapping_add((7 * round_step) as u8)
-                & 0x1F,
-            ..blueprint
-        },
-    ];
-    variants
+        .enumerate()
+        .filter_map(|(index, (dominant, secondary))| {
+            let dominant = dominant.or(fallback_peak)?;
+            let secondary = secondary.or(fallback_peak).unwrap_or(dominant);
+            let shift = signature
+                .shift_scores
+                .get(index % signature.shift_scores.len())
+                .or(fallback_shift)?;
+            Some(OperatorBlueprint {
+                dominant_index: dominant.index as u16,
+                dominant_positive: !dominant.coefficient.is_sign_negative(),
+                primary_shift: shift.shift as u8,
+                shift_match: (((shift.matching_bits * 0x1FF) + signature.bit_len / 2)
+                    / signature.bit_len) as u16,
+                derivative_density: base_blueprint.derivative_density,
+                popcnt_density: base_blueprint.popcnt_density,
+                secondary_delta: ((secondary.index ^ dominant.index) & 0x1F) as u8,
+                tertiary_delta: (((signature.fingerprint >> (index * 5)) as usize ^ dominant.index)
+                    & 0x1F) as u8,
+                fingerprint_bias: ((signature.fingerprint >> (index * 3)) & 0x1F) as u8,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(variants
         .into_iter()
+        .chain(std::iter::once(base_blueprint))
         .filter_map(|variant| MagicKey::from_operator_blueprint(&variant).ok())
-        .collect()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect())
 }
 
 fn parse_operator_runtime_key(
@@ -1219,6 +1159,15 @@ fn apply_operator_word_u_k_with_runtime(
         },
     );
     generated.apply_inverse(feistel_inverse(reflected, feistel)?)
+}
+
+fn invert_operator_word_u_k_with_runtime(
+    value: u64,
+    operator: &SpectralOperatorKey,
+    generated: &GeneratedBase,
+    feistel: &FeistelKey,
+) -> Result<u64, String> {
+    apply_operator_word_u_k_with_runtime(value, operator, generated, feistel)
 }
 
 fn repeat_byte(byte: u8) -> u64 {
@@ -1444,53 +1393,9 @@ fn unpack_bools(bytes: &[u8], count: usize) -> Result<Vec<bool>, String> {
 }
 
 fn encoded_size_of(block: &BlockEncoding) -> usize {
-    match block {
-        BlockEncoding::Raw(raw) => 1 + 4 + 4 + raw.payload.len(),
-        BlockEncoding::Alphabet(alpha) => {
-            1 + 4 + 1 + 1 + alpha.alphabet.len() + 4 + alpha.breadcrumbs.len()
-        }
-        BlockEncoding::SparseAlphabet(alpha) => {
-            1 + 4
-                + 1
-                + 1
-                + alpha.dense_alphabet.len()
-                + 4
-                + alpha.dense_breadcrumbs.len()
-                + 1
-                + alpha.exception_alphabet.len()
-                + 4
-                + alpha.exception_indices.len()
-                + 4
-                + alpha.exception_positions.len()
-        }
-        BlockEncoding::Spectral(spectral) => {
-            1 + 4 + 2 + spectral.key.len() + 4 + spectral.residual.len()
-        }
-        BlockEncoding::Trajectory(trajectory) => {
-            1 + 4
-                + 2
-                + trajectory.key.len()
-                + 2
-                + trajectory.terminals.len() * 8
-                + 4
-                + trajectory.terminal_indices.len()
-                + 1
-                + 4
-                + trajectory.breadcrumbs.len()
-        }
-        BlockEncoding::Operator(operator) => {
-            1 + 4
-                + 2
-                + operator.key.len()
-                + 2
-                + operator.terminals.len() * 8
-                + 4
-                + operator.terminal_indices.len()
-                + 1
-                + 4
-                + operator.breadcrumbs.len()
-        }
-    }
+    let mut out = Vec::new();
+    append_serialized_block(&mut out, block);
+    out.len()
 }
 
 fn serialize_single_layer_archive(archive: &Archive) -> Result<Vec<u8>, String> {
@@ -1502,79 +1407,83 @@ fn serialize_single_layer_archive(archive: &Archive) -> Result<Vec<u8>, String> 
     push_u32(&mut out, archive.header.block_count);
 
     for block in &archive.blocks {
-        match block {
-            BlockEncoding::Raw(raw) => {
-                out.push(block.mode() as u8);
-                push_u32(&mut out, raw.original_len);
-                push_u32(&mut out, raw.payload.len() as u32);
-                out.extend_from_slice(&raw.payload);
-            }
-            BlockEncoding::Alphabet(alpha) => {
-                out.push(block.mode() as u8);
-                push_u32(&mut out, alpha.original_len);
-                out.push(alpha.alphabet.len() as u8);
-                out.push(alpha.bit_width);
-                out.extend_from_slice(&alpha.alphabet);
-                push_u32(&mut out, alpha.breadcrumbs.len() as u32);
-                out.extend_from_slice(&alpha.breadcrumbs);
-            }
-            BlockEncoding::SparseAlphabet(alpha) => {
-                out.push(block.mode() as u8);
-                push_u32(&mut out, alpha.original_len);
-                out.push(alpha.dense_alphabet.len() as u8);
-                out.push(alpha.dense_bit_width);
-                out.extend_from_slice(&alpha.dense_alphabet);
-                push_u32(&mut out, alpha.dense_breadcrumbs.len() as u32);
-                out.extend_from_slice(&alpha.dense_breadcrumbs);
-                out.push(alpha.exception_alphabet.len() as u8);
-                out.extend_from_slice(&alpha.exception_alphabet);
-                push_u32(&mut out, alpha.exception_indices.len() as u32);
-                out.extend_from_slice(&alpha.exception_indices);
-                push_u32(&mut out, alpha.exception_positions.len() as u32);
-                out.extend_from_slice(&alpha.exception_positions);
-            }
-            BlockEncoding::Spectral(spectral) => {
-                out.push(block.mode() as u8);
-                push_u32(&mut out, spectral.original_len);
-                push_u16(&mut out, spectral.key.len() as u16);
-                out.extend_from_slice(&spectral.key);
-                push_u32(&mut out, spectral.residual.len() as u32);
-                out.extend_from_slice(&spectral.residual);
-            }
-            BlockEncoding::Trajectory(trajectory) => {
-                out.push(block.mode() as u8);
-                push_u32(&mut out, trajectory.original_len);
-                push_u16(&mut out, trajectory.key.len() as u16);
-                out.extend_from_slice(&trajectory.key);
-                push_u16(&mut out, trajectory.terminals.len() as u16);
-                for terminal in &trajectory.terminals {
-                    push_u64(&mut out, *terminal);
-                }
-                push_u32(&mut out, trajectory.terminal_indices.len() as u32);
-                out.extend_from_slice(&trajectory.terminal_indices);
-                out.push(trajectory.steps);
-                push_u32(&mut out, trajectory.breadcrumbs.len() as u32);
-                out.extend_from_slice(&trajectory.breadcrumbs);
-            }
-            BlockEncoding::Operator(operator) => {
-                out.push(block.mode() as u8);
-                push_u32(&mut out, operator.original_len);
-                push_u16(&mut out, operator.key.len() as u16);
-                out.extend_from_slice(&operator.key);
-                push_u16(&mut out, operator.terminals.len() as u16);
-                for terminal in &operator.terminals {
-                    push_u64(&mut out, *terminal);
-                }
-                push_u32(&mut out, operator.terminal_indices.len() as u32);
-                out.extend_from_slice(&operator.terminal_indices);
-                out.push(operator.steps);
-                push_u32(&mut out, operator.breadcrumbs.len() as u32);
-                out.extend_from_slice(&operator.breadcrumbs);
-            }
-        }
+        append_serialized_block(&mut out, block);
     }
 
     Ok(out)
+}
+
+fn append_serialized_block(out: &mut Vec<u8>, block: &BlockEncoding) {
+    match block {
+        BlockEncoding::Raw(raw) => {
+            out.push(block.mode() as u8);
+            push_u32(out, raw.original_len);
+            push_u32(out, raw.payload.len() as u32);
+            out.extend_from_slice(&raw.payload);
+        }
+        BlockEncoding::Alphabet(alpha) => {
+            out.push(block.mode() as u8);
+            push_u32(out, alpha.original_len);
+            out.push(alpha.alphabet.len() as u8);
+            out.push(alpha.bit_width);
+            out.extend_from_slice(&alpha.alphabet);
+            push_u32(out, alpha.breadcrumbs.len() as u32);
+            out.extend_from_slice(&alpha.breadcrumbs);
+        }
+        BlockEncoding::SparseAlphabet(alpha) => {
+            out.push(block.mode() as u8);
+            push_u32(out, alpha.original_len);
+            out.push(alpha.dense_alphabet.len() as u8);
+            out.push(alpha.dense_bit_width);
+            out.extend_from_slice(&alpha.dense_alphabet);
+            push_u32(out, alpha.dense_breadcrumbs.len() as u32);
+            out.extend_from_slice(&alpha.dense_breadcrumbs);
+            out.push(alpha.exception_alphabet.len() as u8);
+            out.extend_from_slice(&alpha.exception_alphabet);
+            push_u32(out, alpha.exception_indices.len() as u32);
+            out.extend_from_slice(&alpha.exception_indices);
+            push_u32(out, alpha.exception_positions.len() as u32);
+            out.extend_from_slice(&alpha.exception_positions);
+        }
+        BlockEncoding::Spectral(spectral) => {
+            out.push(block.mode() as u8);
+            push_u32(out, spectral.original_len);
+            push_u16(out, spectral.key.len() as u16);
+            out.extend_from_slice(&spectral.key);
+            push_u32(out, spectral.residual.len() as u32);
+            out.extend_from_slice(&spectral.residual);
+        }
+        BlockEncoding::Trajectory(trajectory) => {
+            out.push(block.mode() as u8);
+            push_u32(out, trajectory.original_len);
+            push_u16(out, trajectory.key.len() as u16);
+            out.extend_from_slice(&trajectory.key);
+            push_u16(out, trajectory.terminals.len() as u16);
+            for terminal in &trajectory.terminals {
+                push_u64(out, *terminal);
+            }
+            push_u32(out, trajectory.terminal_indices.len() as u32);
+            out.extend_from_slice(&trajectory.terminal_indices);
+            out.push(trajectory.steps);
+            push_u32(out, trajectory.breadcrumbs.len() as u32);
+            out.extend_from_slice(&trajectory.breadcrumbs);
+        }
+        BlockEncoding::Operator(operator) => {
+            out.push(block.mode() as u8);
+            push_u32(out, operator.original_len);
+            push_u16(out, operator.key.len() as u16);
+            out.extend_from_slice(&operator.key);
+            push_u16(out, operator.terminals.len() as u16);
+            for terminal in &operator.terminals {
+                push_u64(out, *terminal);
+            }
+            push_u32(out, operator.terminal_indices.len() as u32);
+            out.extend_from_slice(&operator.terminal_indices);
+            out.push(operator.steps);
+            push_u32(out, operator.breadcrumbs.len() as u32);
+            out.extend_from_slice(&operator.breadcrumbs);
+        }
+    }
 }
 
 fn serialize_recursive_archive(
@@ -2008,10 +1917,11 @@ mod compact_codec_tests {
     use super::{
         apply_operator_word_u_k, build_operator_codec_key, compress_bytes,
         compress_bytes_with_outcome, compress_single_layer_bytes, decompress_bytes, encode_block,
-        encoded_size_of, grouped_trajectory_score, parse_archive, score_operator_key,
-        search_operator_codec_key, serialize_single_layer_archive, synthesise_spectral_bytes,
-        try_encode_operator_block, Archive, ArchiveHeader, BlockEncoding, MagicKey, OperatorBlock,
-        RawBlock, SpectralBlock, DEFAULT_BLOCK_SIZE_BYTES, MAGIC_MULTI,
+        encoded_size_of, grouped_trajectory_score, inspect_archive, parse_archive,
+        score_operator_key, select_operator_codec_key_from_family, serialize_single_layer_archive,
+        synthesise_spectral_bytes, try_encode_operator_block, Archive, ArchiveHeader,
+        BlockEncoding, MagicKey, OperatorBlock, RawBlock, SpectralBlock, DEFAULT_BLOCK_SIZE_BYTES,
+        MAGIC_MULTI,
     };
     use crate::domain::kernel::topology::{analyze_topology, compile_spectral_key};
 
@@ -2071,6 +1981,16 @@ mod compact_codec_tests {
         assert!(!outcome.layer_summaries.is_empty());
         assert_eq!(decompress_bytes(&outcome.archive).unwrap(), input);
         assert!(outcome.archive.len() < input.len() + 29);
+    }
+
+    #[test]
+    fn inspect_archive_reports_real_input_size_for_single_layer_archives() {
+        let input = b"0123456789".repeat(200);
+        let packed = compress_single_layer_bytes(&input, 256).unwrap();
+        let layers = inspect_archive(&packed).unwrap();
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].input_size, input.len() as u64);
+        assert_eq!(layers[0].output_size, packed.len() as u64);
     }
 
     #[test]
@@ -2205,7 +2125,7 @@ mod compact_codec_tests {
     }
 
     #[test]
-    fn operator_search_never_returns_a_key_worse_than_the_structural_seed() {
+    fn operator_family_selection_never_returns_a_key_worse_than_the_structural_seed() {
         let input = (0..64_u64)
             .flat_map(|value| {
                 value
@@ -2220,7 +2140,7 @@ mod compact_codec_tests {
             .collect::<Vec<_>>();
         let seed = build_operator_codec_key(&input).unwrap();
         let seed_score = score_operator_key(&words, seed).unwrap();
-        if let Some(found) = search_operator_codec_key(&input, &words).unwrap() {
+        if let Some(found) = select_operator_codec_key_from_family(&input, &words).unwrap() {
             let found_score = score_operator_key(&words, found).unwrap();
             assert!(
                 super::is_better_operator_score(found_score, seed_score)
@@ -2303,5 +2223,30 @@ mod compact_codec_tests {
             .flat_map(|value| value.to_le_bytes())
             .collect::<Vec<_>>();
         assert_eq!(super::decode_operator_block(&block).unwrap(), expected);
+    }
+
+    #[test]
+    fn encoded_size_of_matches_the_single_block_wire_format() {
+        let input = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz+/".repeat(8);
+        for block in [
+            BlockEncoding::Raw(RawBlock {
+                original_len: input.len() as u32,
+                payload: input.clone(),
+            }),
+            encode_block(&input).unwrap(),
+        ] {
+            let archive = Archive {
+                header: ArchiveHeader {
+                    base_version: 1,
+                    block_size_bytes: input.len() as u32,
+                    original_size: input.len() as u64,
+                    block_count: 1,
+                },
+                blocks: vec![block.clone()],
+            };
+            let wire = serialize_single_layer_archive(&archive).unwrap();
+            let header_len = 8 + 1 + 4 + 8 + 4;
+            assert_eq!(encoded_size_of(&block), wire.len() - header_len);
+        }
     }
 }
