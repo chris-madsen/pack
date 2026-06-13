@@ -1,9 +1,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::domain::codec::GeneratorDebugBlock;
 use crate::domain::codec::{
     compress_bytes, compress_bytes_generator_only_strict, compress_bytes_with_outcome,
-    decompress_bytes,
+    debug_generator_only_strict, decompress_bytes,
 };
 use crate::domain::model::CompressionReport;
 
@@ -84,6 +85,15 @@ pub fn benchmark_directory_generator_only_strict(
         .into_iter()
         .map(|file_path| benchmark_file_generator_only_strict(&file_path, block_size))
         .collect()
+}
+
+pub fn debug_file_generator_only_strict(
+    path: &Path,
+    block_size: Option<usize>,
+) -> Result<Vec<GeneratorDebugBlock>, String> {
+    let data =
+        fs::read(path).map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    debug_generator_only_strict(&data, block_size)
 }
 
 pub fn benchmark_file_generator_only_strict(

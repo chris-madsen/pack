@@ -253,6 +253,36 @@ pub fn strongest_binary_word_peaks(
     Ok(peaks)
 }
 
+pub fn apply_strict_operator_step(words: &mut [u64], key: u64) -> Result<(), String> {
+    if words.is_empty() || !words.len().is_power_of_two() {
+        return Err("strict operator requires a non-empty power-of-two word slice".to_string());
+    }
+    let bytes = key.to_le_bytes();
+    apply_strict_routing_forward(words, &bytes);
+    if strict_uses_butterfly(&bytes) {
+        apply_slice_butterfly_forward(words);
+    }
+    for (index, word) in words.iter_mut().enumerate() {
+        *word = strict_word_forward(*word, &bytes, index);
+    }
+    Ok(())
+}
+
+pub fn apply_strict_operator_inverse_step(words: &mut [u64], key: u64) -> Result<(), String> {
+    if words.is_empty() || !words.len().is_power_of_two() {
+        return Err("strict operator requires a non-empty power-of-two word slice".to_string());
+    }
+    let bytes = key.to_le_bytes();
+    for (index, word) in words.iter_mut().enumerate() {
+        *word = strict_word_inverse(*word, &bytes, index);
+    }
+    if strict_uses_butterfly(&bytes) {
+        apply_slice_butterfly_inverse(words);
+    }
+    apply_strict_routing_inverse(words, &bytes);
+    Ok(())
+}
+
 pub fn cnot_stage(mut value: u64, half_width: usize) -> u64 {
     let block_width = half_width * 2;
     for block_start in (0..64).step_by(block_width) {
@@ -429,6 +459,95 @@ fn apply_slice_butterfly_inverse(words: &mut [u64]) {
             break;
         }
         half_width /= 2;
+    }
+}
+
+fn strict_word_forward(value: u64, key_bytes: &[u8; 8], word_index: usize) -> u64 {
+    let phase = strict_phase_mask(key_bytes, word_index);
+    let affine = strict_affine_mask(key_bytes, word_index);
+    let rotate_left = strict_rotate_left(key_bytes, word_index);
+    let rotate_right = strict_rotate_right(key_bytes, word_index);
+    let shift = strict_shift(key_bytes, word_index);
+    let mut out = value ^ phase;
+    out = out.rotate_left(rotate_left);
+    out = gf2_right_mix_forward(out, shift);
+    out ^= affine;
+    out.rotate_right(rotate_right)
+}
+
+fn strict_word_inverse(value: u64, key_bytes: &[u8; 8], word_index: usize) -> u64 {
+    let phase = strict_phase_mask(key_bytes, word_index);
+    let affine = strict_affine_mask(key_bytes, word_index);
+    let rotate_left = strict_rotate_left(key_bytes, word_index);
+    let rotate_right = strict_rotate_right(key_bytes, word_index);
+    let shift = strict_shift(key_bytes, word_index);
+    let mut out = value.rotate_left(rotate_right);
+    out ^= affine;
+    out = gf2_right_mix_inverse(out, shift);
+    out = out.rotate_right(rotate_left);
+    out ^ phase
+}
+
+fn strict_phase_mask(key_bytes: &[u8; 8], word_index: usize) -> u64 {
+    let mut bytes = [0_u8; 8];
+    for (slot, byte) in bytes.iter_mut().enumerate() {
+        *byte = key_bytes[(slot + word_index) % key_bytes.len()]
+            .rotate_left(((slot + word_index) % 8) as u32);
+    }
+    u64::from_le_bytes(bytes).rotate_left(((word_index * 7) % 64) as u32)
+}
+
+fn strict_affine_mask(key_bytes: &[u8; 8], word_index: usize) -> u64 {
+    let mut bytes = [0_u8; 8];
+    for (slot, byte) in bytes.iter_mut().enumerate() {
+        *byte = key_bytes
+            [(key_bytes.len() + slot - (word_index % key_bytes.len())) % key_bytes.len()]
+        .wrapping_add((slot as u8).wrapping_mul(17));
+    }
+    u64::from_le_bytes(bytes).rotate_right(((word_index * 11) % 64) as u32)
+}
+
+fn strict_rotate_left(key_bytes: &[u8; 8], word_index: usize) -> u32 {
+    (u32::from(key_bytes[4].wrapping_add(word_index as u8)) % 63) + 1
+}
+
+fn strict_rotate_right(key_bytes: &[u8; 8], word_index: usize) -> u32 {
+    (u32::from(key_bytes[2].wrapping_add((word_index as u8).wrapping_mul(3))) % 63) + 1
+}
+
+fn strict_shift(key_bytes: &[u8; 8], word_index: usize) -> u8 {
+    ((key_bytes[5].wrapping_add((word_index as u8).wrapping_mul(5))) % 63) + 1
+}
+
+fn strict_lane_rotate(key_bytes: &[u8; 8], len: usize) -> usize {
+    usize::from(key_bytes[6]) % len.max(1)
+}
+
+fn strict_uses_butterfly(key_bytes: &[u8; 8]) -> bool {
+    key_bytes[7] & 0x01 != 0
+}
+
+fn apply_strict_routing_forward(words: &mut [u64], key_bytes: &[u8; 8]) {
+    if words.is_empty() {
+        return;
+    }
+    match (key_bytes[7] >> 1) & 0x03 {
+        0 => {}
+        1 => words.rotate_left(strict_lane_rotate(key_bytes, words.len())),
+        2 => words.rotate_right(strict_lane_rotate(key_bytes, words.len())),
+        _ => words.reverse(),
+    }
+}
+
+fn apply_strict_routing_inverse(words: &mut [u64], key_bytes: &[u8; 8]) {
+    if words.is_empty() {
+        return;
+    }
+    match (key_bytes[7] >> 1) & 0x03 {
+        0 => {}
+        1 => words.rotate_right(strict_lane_rotate(key_bytes, words.len())),
+        2 => words.rotate_left(strict_lane_rotate(key_bytes, words.len())),
+        _ => words.reverse(),
     }
 }
 

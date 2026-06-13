@@ -77,8 +77,17 @@ pub struct TrajectoryBlock {
 pub struct OperatorBlock {
     pub original_len: u32,
     pub key: Vec<u8>,
-    pub seed: Vec<u8>,
-    pub branches: Vec<u8>,
+    pub steps: u8,
+    pub terminal_mode: OperatorTerminalMode,
+    pub terminal_payload: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OperatorTerminalMode {
+    UniformWord = 0,
+    SmallPalette = 1,
+    SparseWordExceptions = 2,
+    RawTerminal = 3,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

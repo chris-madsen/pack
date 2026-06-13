@@ -267,6 +267,65 @@ pub fn compile_spectral_key(signature: &TopologySignature) -> Result<MagicKey, S
     })
 }
 
+pub fn compile_strict_operator_key(
+    signature: &TopologySignature,
+    window_bits: usize,
+) -> Result<u64, String> {
+    if signature.bit_len != window_bits {
+        return Err("signature bit length does not match the selected window".to_string());
+    }
+    if signature.walsh_peaks.is_empty() || signature.shift_scores.is_empty() {
+        return Err("signature lacks required topology features".to_string());
+    }
+
+    let peak0 = &signature.walsh_peaks[0];
+    let peak1 = signature
+        .walsh_peaks
+        .get(1)
+        .unwrap_or(&signature.walsh_peaks[0]);
+    let shift0 = signature.shift_scores[0].shift.max(1);
+    let shift1 = signature
+        .shift_scores
+        .get(1)
+        .map(|score| score.shift)
+        .unwrap_or(shift0)
+        .max(1);
+    let derivative_ones = signature.derivative.iter().filter(|bit| **bit == 1).count();
+    let derivative_density =
+        (derivative_ones * 255 / signature.derivative.len().max(1)).min(255) as u8;
+    let popcnt_sum = signature
+        .popcnt_profile
+        .iter()
+        .map(|count| *count as usize)
+        .sum::<usize>();
+    let popcnt_mean = (popcnt_sum / signature.popcnt_profile.len().max(1)).min(255) as u8;
+    let popcnt_first = signature.popcnt_profile.first().copied().unwrap_or(0);
+    let dominance = signature
+        .walsh_peaks
+        .iter()
+        .map(|peak| peak.coefficient.unsigned_abs() as usize)
+        .sum::<usize>()
+        .max(1);
+    let dominance_byte =
+        ((peak0.coefficient.unsigned_abs() as usize * 255) / dominance).min(255) as u8;
+    let rounds =
+        (((dominance_byte as usize + derivative_density as usize) / 32).clamp(1, 15) as u8) & 0x0F;
+    let routing = if shift0 >= shift1 { 0b01 } else { 0b10 };
+    let family = if peak0.coefficient >= 0 { 0b01 } else { 0b10 };
+
+    let bytes = [
+        (peak0.index & 0xFF) as u8,
+        ((peak0.index >> 8) as u8) ^ popcnt_first,
+        (peak1.index & 0xFF) as u8,
+        ((peak1.index >> 8) as u8) ^ popcnt_mean,
+        (shift0.min(63)) as u8,
+        (shift1.min(63)) as u8,
+        derivative_density,
+        dominance_byte ^ ((rounds << 4) | (family << 2) | routing),
+    ];
+    Ok(u64::from_le_bytes(bytes))
+}
+
 fn integer_fwht(values: &mut [i32]) -> Result<(), String> {
     if values.is_empty() || !values.len().is_power_of_two() {
         return Err("FWHT length must be a non-zero power of two".to_string());
@@ -399,7 +458,8 @@ fn avalanche(mut value: u64) -> u64 {
 mod tests {
     use super::{
         analyze_topology, circular_bit_derivative, compile_spectral_key,
-        compile_topology_to_constant, popcnt_profile, shift_correlation, MAX_SPECTRAL_PEAKS,
+        compile_strict_operator_key, compile_topology_to_constant, popcnt_profile,
+        shift_correlation, MAX_SPECTRAL_PEAKS,
     };
     use crate::domain::kernel::key::{ConstantFamily, PackedConstantK};
 
@@ -538,6 +598,14 @@ mod tests {
         let packed = compile_topology_to_constant(&signature, 4096).unwrap();
         let parsed = PackedConstantK::parse(packed.as_bytes()).unwrap();
         assert_eq!(parsed, packed);
+    }
+
+    #[test]
+    fn strict_operator_key_is_exactly_64_bits() {
+        let input = [0x42_u8; 512];
+        let signature = analyze_topology(&input).unwrap();
+        let key = compile_strict_operator_key(&signature, input.len() * 8).unwrap();
+        assert_eq!(key.to_le_bytes().len(), 8);
     }
 
     /// Phase mask and affine mask must not be trivially correlated.

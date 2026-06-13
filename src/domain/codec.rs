@@ -4,14 +4,13 @@ use crate::domain::bitstream::{
     bit_width_for_cardinality, ceil_div_u64, pack_indices, unpack_indices,
 };
 use crate::domain::kernel::budget::{BitBudget, CompressionPolicy};
-use crate::domain::kernel::key::{MagicKey, PackedConstantK};
+use crate::domain::kernel::key::MagicKey;
 use crate::domain::kernel::operator::{
-    contract_block as contract_operator_block, expand_block as expand_operator_block,
-    materialize_runtime,
+    apply_strict_operator_inverse_step, apply_strict_operator_step,
 };
 use crate::domain::kernel::spectral::synthesise_spectral_bits;
 use crate::domain::kernel::topology::{
-    analyze_topology, block_fingerprint, compile_spectral_key, compile_topology_to_constant,
+    analyze_topology, block_fingerprint, compile_spectral_key, compile_strict_operator_key,
     TopologySignature,
 };
 use crate::domain::kernel::trajectory::{
@@ -19,7 +18,8 @@ use crate::domain::kernel::trajectory::{
 };
 use crate::domain::model::{
     AlphabetBlock, Archive, ArchiveHeader, BlockAnalysis, BlockEncoding, BlockRecord, LayerSummary,
-    OperatorBlock, PassWindowBand, RawBlock, SparseAlphabetBlock, SpectralBlock, TrajectoryBlock,
+    OperatorBlock, OperatorTerminalMode, PassWindowBand, RawBlock, SparseAlphabetBlock,
+    SpectralBlock, TrajectoryBlock,
 };
 
 const MAGIC_SINGLE: &[u8; 8] = b"PACKMVP1";
@@ -31,10 +31,13 @@ const RECURSIVE_HEADER_BYTES: usize = 27;
 const LAYER_SUMMARY_BYTES: usize = 18;
 const MIN_WINDOW_BYTES: usize = 16;
 const MAX_WINDOW_BYTES: usize = 2048;
+const MAX_STRICT_WINDOW_BYTES: usize = 16384;
+const MAX_STRICT_OPERATOR_STEPS: u8 = 64;
+const STRICT_GENERATOR_GAIN_FRACTION: f64 = 0.9;
 /// Byte length of the PACKMVP1 single-layer archive header:
 /// magic(8) + version(1) + window_min_exp(1) + window_max_exp(1)
 /// + original_size(8) + block_count(4) = 23 bytes.
-const SINGLE_LAYER_HEADER_BYTES: usize = 23;
+pub(crate) const SINGLE_LAYER_HEADER_BYTES: usize = 23;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CompressionProfile {
@@ -72,6 +75,21 @@ pub struct CompressionOutcome {
     pub layer_summaries: Vec<LayerSummary>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GeneratorDebugBlock {
+    pub offset: usize,
+    pub window_bytes: usize,
+    pub key_hex: String,
+    pub steps: Option<u8>,
+    pub terminal_mode: Option<OperatorTerminalMode>,
+    pub key_bits: u64,
+    pub crumb_bits: u64,
+    pub overhead_bits: u64,
+    pub total_bits: u64,
+    pub accepted: bool,
+    pub reject_reason: String,
+}
+
 pub fn compress_bytes(input: &[u8], block_size_hint: Option<usize>) -> Result<Vec<u8>, String> {
     compress_bytes_with_profile(input, block_size_hint, CompressionProfile::General)
         .map(|outcome| outcome.archive)
@@ -95,6 +113,51 @@ pub fn compress_bytes_generator_only_strict(
     )
 }
 
+pub fn debug_generator_only_strict(
+    input: &[u8],
+    block_size_hint: Option<usize>,
+) -> Result<Vec<GeneratorDebugBlock>, String> {
+    let band = analyze_pass_band(
+        input,
+        block_size_hint,
+        0,
+        CompressionProfile::StrictGeneratorOnly,
+    )?;
+    let sizes = window_sizes_for_band(band)?;
+    let mut reports = Vec::new();
+    let mut offset = 0_usize;
+    while offset < input.len() {
+        let remaining = &input[offset..];
+        let fitting_sizes = sizes
+            .iter()
+            .copied()
+            .filter(|size| remaining.len() >= *size)
+            .collect::<Vec<_>>();
+        if fitting_sizes.is_empty() {
+            reports.push(GeneratorDebugBlock {
+                offset,
+                window_bytes: remaining.len(),
+                key_hex: String::new(),
+                steps: None,
+                terminal_mode: None,
+                key_bits: 0,
+                crumb_bits: (remaining.len() * 8) as u64,
+                overhead_bits: 0,
+                total_bits: (remaining.len() * 8) as u64,
+                accepted: false,
+                reject_reason: "tail-smaller-than-min-window".to_string(),
+            });
+            break;
+        }
+        for size in &fitting_sizes {
+            reports.push(debug_strict_operator_block(&remaining[..*size], offset)?);
+        }
+        let (_, _, block_size) = select_strict_generator_block(remaining, &sizes)?;
+        offset += block_size;
+    }
+    Ok(reports)
+}
+
 fn compress_bytes_with_profile(
     input: &[u8],
     block_size_hint: Option<usize>,
@@ -107,7 +170,7 @@ fn compress_bytes_with_profile(
 
     let mut first_layer_attempted = false;
     for layer_index in 0..MAX_LAYERS {
-        let band = analyze_pass_band(&current, block_size_hint, layer_index)?;
+        let band = analyze_pass_band(&current, block_size_hint, layer_index, profile)?;
         let best = compress_single_layer_bytes_with_profile(&current, band, profile)?;
         if layer_index == 0 {
             first_layer_attempted = true;
@@ -210,9 +273,7 @@ pub fn inspect_archive(input: &[u8]) -> Result<Vec<LayerSummary>, String> {
         // fixed 23-byte PACKMVP1 header).  This is consistent with the
         // multi-layer format where output_size tracks the compressed data
         // bytes, not the full framed archive.
-        let payload_size = input
-            .len()
-            .saturating_sub(SINGLE_LAYER_HEADER_BYTES) as u64;
+        let payload_size = input.len().saturating_sub(SINGLE_LAYER_HEADER_BYTES) as u64;
         return Ok(vec![LayerSummary {
             window_min_bits: 1_u32 << archive.header.window_min_exp,
             window_max_bits: 1_u32 << archive.header.window_max_exp,
@@ -236,8 +297,9 @@ fn analyze_pass_band(
     input: &[u8],
     block_size_hint: Option<usize>,
     layer_index: usize,
+    profile: CompressionProfile,
 ) -> Result<PassWindowBand, String> {
-    let available = candidate_window_sizes(input.len());
+    let available = candidate_window_sizes(input.len(), profile);
     let hint =
         block_size_hint.filter(|value| value.is_power_of_two() && *value >= MIN_WINDOW_BYTES);
     if available.is_empty() {
@@ -294,8 +356,12 @@ fn analyze_pass_band(
     })
 }
 
-fn candidate_window_sizes(input_len: usize) -> Vec<usize> {
-    let capped = input_len.min(MAX_WINDOW_BYTES);
+fn candidate_window_sizes(input_len: usize, profile: CompressionProfile) -> Vec<usize> {
+    let cap = match profile {
+        CompressionProfile::General => MAX_WINDOW_BYTES,
+        CompressionProfile::StrictGeneratorOnly => MAX_STRICT_WINDOW_BYTES,
+    };
+    let capped = input_len.min(cap);
     let mut size = MIN_WINDOW_BYTES;
     let mut out = Vec::new();
     while size <= capped {
@@ -400,7 +466,7 @@ fn encode_block_with_profile(
             None
         };
 
-    let maybe_operator = try_encode_operator_block(block, cached_topology.as_ref())?;
+    let maybe_operator = try_encode_operator_block(block, cached_topology.as_ref(), profile)?;
     let maybe_spectral = if profile == CompressionProfile::General {
         try_encode_spectral_block(block, cached_topology.as_ref())?
     } else {
@@ -471,6 +537,12 @@ struct TerminalPalettePlan {
     breadcrumbs: Vec<bool>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OperatorTerminalCandidate {
+    mode: OperatorTerminalMode,
+    payload: Vec<u8>,
+}
+
 #[cfg(test)]
 fn compress_single_layer_bytes(input: &[u8], band: PassWindowBand) -> Result<Vec<u8>, String> {
     compress_single_layer_bytes_with_profile(input, band, CompressionProfile::General)
@@ -486,11 +558,24 @@ fn compress_single_layer_bytes_with_profile(
     let mut blocks = Vec::new();
     let mut offset = 0_usize;
     while offset < input.len() {
-        let (window_index, block_size) = select_block_window(&input[offset..], &block_sizes)?;
-        let block = &input[offset..offset + block_size];
+        let (window_index, encoding, block_size) = match profile {
+            CompressionProfile::General => {
+                let (window_index, block_size) =
+                    select_block_window(&input[offset..], &block_sizes)?;
+                let block = &input[offset..offset + block_size];
+                (
+                    window_index,
+                    encode_block_with_profile(block, profile)?,
+                    block_size,
+                )
+            }
+            CompressionProfile::StrictGeneratorOnly => {
+                select_strict_generator_block(&input[offset..], &block_sizes)?
+            }
+        };
         blocks.push(BlockRecord {
             window_index,
-            encoding: encode_block_with_profile(block, profile)?,
+            encoding,
         });
         offset += block_size;
     }
@@ -510,6 +595,41 @@ fn compress_single_layer_bytes_with_profile(
         band,
         output: serialize_single_layer_archive(&archive)?,
     })
+}
+
+fn select_strict_generator_block(
+    input: &[u8],
+    sizes: &[usize],
+) -> Result<(u8, BlockEncoding, usize), String> {
+    let mut best: Option<(u8, BlockEncoding, usize)> = None;
+    for (index, &size) in sizes.iter().enumerate() {
+        let Some(block) = input.get(..size) else {
+            continue;
+        };
+        let encoding = encode_block_with_profile(block, CompressionProfile::StrictGeneratorOnly)?;
+        let candidate = (index as u8, encoding, size);
+        let should_replace = match best.as_ref() {
+            None => true,
+            Some((_, best_encoding, best_size)) => {
+                let lhs = encoded_size_of(&candidate.1) * *best_size;
+                let rhs = encoded_size_of(best_encoding) * candidate.2;
+                lhs < rhs
+                    || (lhs == rhs
+                        && encoded_size_of(&candidate.1) < encoded_size_of(best_encoding))
+            }
+        };
+        if should_replace {
+            best = Some(candidate);
+        }
+    }
+    Ok(best.unwrap_or((
+        0,
+        BlockEncoding::Raw(RawBlock {
+            original_len: input.len() as u32,
+            payload: input.to_vec(),
+        }),
+        input.len().max(1),
+    )))
 }
 
 fn decompress_single_layer_bytes(input: &[u8]) -> Result<Vec<u8>, String> {
@@ -696,7 +816,7 @@ fn try_encode_sparse_alphabet_block(
 fn trajectory_block_crumb_bytes(candidate: &BlockEncoding) -> usize {
     match candidate {
         BlockEncoding::Trajectory(t) => t.breadcrumbs.len() + t.terminal_indices.len(),
-        BlockEncoding::Operator(o) => o.seed.len() + o.branches.len(),
+        BlockEncoding::Operator(o) => o.terminal_payload.len(),
         _ => 0,
     }
 }
@@ -754,6 +874,7 @@ fn try_encode_trajectory_block(block: &[u8]) -> Result<Option<BlockEncoding>, St
 fn try_encode_operator_block(
     block: &[u8],
     cached_topology: Option<&TopologySignature>,
+    profile: CompressionProfile,
 ) -> Result<Option<BlockEncoding>, String> {
     if block.len() < 16 || block.len() % 8 != 0 || !block.len().is_power_of_two() {
         return Ok(None);
@@ -762,28 +883,296 @@ fn try_encode_operator_block(
         Some(sig) => sig.clone(),
         None => analyze_topology(block)?,
     };
-    let constant = compile_topology_to_constant(&signature, block.len() * 8)?;
-    let runtime = materialize_runtime(&constant, block.len() * 8)?;
-    let (seed, branches) = contract_operator_block(&runtime, block)?;
-    let key = constant.into_bytes();
-    let candidate = BlockEncoding::Operator(OperatorBlock {
-        original_len: block.len() as u32,
-        key: key.clone(),
-        seed: seed.clone(),
-        branches: branches.clone(),
-    });
-    let overhead_bytes = encoded_size_of(&candidate)
-        .checked_sub(key.len())
-        .and_then(|value| value.checked_sub(seed.len()))
-        .and_then(|value| value.checked_sub(branches.len()))
-        .ok_or_else(|| "operator block accounting underflow".to_string())?;
-    let budget = BitBudget {
-        source_bits: (block.len() * 8) as u64,
-        key_bits: (key.len() * 8) as u64,
-        crumb_bits: ((seed.len() + branches.len()) * 8) as u64,
-        overhead_bits: (overhead_bytes * 8) as u64,
+    let key = compile_strict_operator_key(&signature, block.len() * 8)?
+        .to_le_bytes()
+        .to_vec();
+    let mut words = block
+        .chunks_exact(8)
+        .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
+        .collect::<Vec<_>>();
+    let policy = match profile {
+        CompressionProfile::General => CompressionPolicy::MVP,
+        CompressionProfile::StrictGeneratorOnly => CompressionPolicy {
+            minimum_gain_fraction: STRICT_GENERATOR_GAIN_FRACTION,
+            ..CompressionPolicy::MVP
+        },
     };
-    Ok(CompressionPolicy::MVP.accepts(budget)?.then_some(candidate))
+    let mut best: Option<BlockEncoding> = None;
+    for steps in 1..=MAX_STRICT_OPERATOR_STEPS {
+        apply_strict_operator_step(
+            &mut words,
+            u64::from_le_bytes(key.clone().try_into().unwrap()),
+        )?;
+        let Some(candidate) = build_operator_candidate(block.len() as u32, &key, steps, &words)?
+        else {
+            continue;
+        };
+        let operator = extract_operator_block(&candidate).unwrap();
+        let overhead_bytes = encoded_size_of(&candidate)
+            .checked_sub(operator.key.len())
+            .and_then(|value| value.checked_sub(operator.terminal_payload.len()))
+            .ok_or_else(|| "operator block accounting underflow".to_string())?;
+        let budget = BitBudget {
+            source_bits: (block.len() * 8) as u64,
+            key_bits: 64,
+            crumb_bits: (operator.terminal_payload.len() * 8) as u64,
+            overhead_bits: (overhead_bytes * 8) as u64,
+        };
+        if !policy.accepts(budget)? {
+            continue;
+        }
+        if best
+            .as_ref()
+            .map(|current| encoded_size_of(&candidate) < encoded_size_of(current))
+            .unwrap_or(true)
+        {
+            best = Some(candidate);
+        }
+    }
+    Ok(best)
+}
+
+fn build_operator_candidate(
+    original_len: u32,
+    key: &[u8],
+    steps: u8,
+    words: &[u64],
+) -> Result<Option<BlockEncoding>, String> {
+    let candidate = encode_best_operator_terminal(words)?.map(|terminal| {
+        BlockEncoding::Operator(OperatorBlock {
+            original_len,
+            key: key.to_vec(),
+            steps,
+            terminal_mode: terminal.mode,
+            terminal_payload: terminal.payload,
+        })
+    });
+    Ok(candidate)
+}
+
+fn debug_strict_operator_block(block: &[u8], offset: usize) -> Result<GeneratorDebugBlock, String> {
+    if block.len() < 16 || block.len() % 8 != 0 || !block.len().is_power_of_two() {
+        return Ok(GeneratorDebugBlock {
+            offset,
+            window_bytes: block.len(),
+            key_hex: String::new(),
+            steps: None,
+            terminal_mode: None,
+            key_bits: 0,
+            crumb_bits: (block.len() * 8) as u64,
+            overhead_bits: 0,
+            total_bits: (block.len() * 8) as u64,
+            accepted: false,
+            reject_reason: "window-not-operator-eligible".to_string(),
+        });
+    }
+    let signature = analyze_topology(block)?;
+    let key_u64 = compile_strict_operator_key(&signature, block.len() * 8)?;
+    let key = key_u64.to_le_bytes().to_vec();
+    let mut words = block
+        .chunks_exact(8)
+        .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
+        .collect::<Vec<_>>();
+    let policy = CompressionPolicy {
+        minimum_gain_fraction: STRICT_GENERATOR_GAIN_FRACTION,
+        ..CompressionPolicy::MVP
+    };
+    let mut best_observed: Option<(BlockEncoding, BitBudget)> = None;
+    let mut best: Option<(BlockEncoding, BitBudget)> = None;
+    for steps in 1..=MAX_STRICT_OPERATOR_STEPS {
+        apply_strict_operator_step(&mut words, key_u64)?;
+        let Some(candidate) = build_operator_candidate(block.len() as u32, &key, steps, &words)?
+        else {
+            continue;
+        };
+        let operator = extract_operator_block(&candidate).unwrap();
+        let overhead_bytes = encoded_size_of(&candidate)
+            .checked_sub(operator.key.len())
+            .and_then(|value| value.checked_sub(operator.terminal_payload.len()))
+            .ok_or_else(|| "operator block accounting underflow".to_string())?;
+        let budget = BitBudget {
+            source_bits: (block.len() * 8) as u64,
+            key_bits: 64,
+            crumb_bits: (operator.terminal_payload.len() * 8) as u64,
+            overhead_bits: (overhead_bytes * 8) as u64,
+        };
+        if best_observed
+            .as_ref()
+            .map(|(current, _)| encoded_size_of(&candidate) < encoded_size_of(current))
+            .unwrap_or(true)
+        {
+            best_observed = Some((candidate.clone(), budget));
+        }
+        if !policy.accepts(budget)? {
+            continue;
+        }
+        if best
+            .as_ref()
+            .map(|(current, _)| encoded_size_of(&candidate) < encoded_size_of(current))
+            .unwrap_or(true)
+        {
+            best = Some((candidate, budget));
+        }
+    }
+
+    Ok(match best {
+        Some((candidate, budget)) => {
+            let operator = extract_operator_block(&candidate).unwrap();
+            GeneratorDebugBlock {
+                offset,
+                window_bytes: block.len(),
+                key_hex: hex_string(&key),
+                steps: Some(operator.steps),
+                terminal_mode: Some(operator.terminal_mode),
+                key_bits: budget.key_bits,
+                crumb_bits: budget.crumb_bits,
+                overhead_bits: budget.overhead_bits,
+                total_bits: budget.encoded_bits()?,
+                accepted: true,
+                reject_reason: "accepted".to_string(),
+            }
+        }
+        None => match best_observed {
+            Some((candidate, budget)) => {
+                let operator = extract_operator_block(&candidate).unwrap();
+                GeneratorDebugBlock {
+                    offset,
+                    window_bytes: block.len(),
+                    key_hex: hex_string(&key),
+                    steps: Some(operator.steps),
+                    terminal_mode: Some(operator.terminal_mode),
+                    key_bits: budget.key_bits,
+                    crumb_bits: budget.crumb_bits,
+                    overhead_bits: budget.overhead_bits,
+                    total_bits: budget.encoded_bits()?,
+                    accepted: false,
+                    reject_reason: "best-candidate-above-10x-budget".to_string(),
+                }
+            }
+            None => GeneratorDebugBlock {
+                offset,
+                window_bytes: block.len(),
+                key_hex: hex_string(&key),
+                steps: None,
+                terminal_mode: None,
+                key_bits: 64,
+                crumb_bits: 0,
+                overhead_bits: 0,
+                total_bits: 64,
+                accepted: false,
+                reject_reason: "no-operator-candidate".to_string(),
+            },
+        },
+    })
+}
+
+fn encode_best_operator_terminal(
+    words: &[u64],
+) -> Result<Option<OperatorTerminalCandidate>, String> {
+    if words.is_empty() {
+        return Ok(None);
+    }
+    let mut candidates = Vec::new();
+    if words.iter().all(|word| *word == words[0]) {
+        candidates.push(OperatorTerminalCandidate {
+            mode: OperatorTerminalMode::UniformWord,
+            payload: words[0].to_le_bytes().to_vec(),
+        });
+    }
+    if let Some(palette) = encode_operator_small_palette(words)? {
+        candidates.push(palette);
+    }
+    if let Some(sparse) = encode_operator_sparse_exceptions(words)? {
+        candidates.push(sparse);
+    }
+    candidates.push(OperatorTerminalCandidate {
+        mode: OperatorTerminalMode::RawTerminal,
+        payload: words.iter().flat_map(|word| word.to_le_bytes()).collect(),
+    });
+    Ok(candidates
+        .into_iter()
+        .min_by_key(|candidate| (candidate.payload.len(), candidate.mode as u8)))
+}
+
+fn encode_operator_small_palette(
+    words: &[u64],
+) -> Result<Option<OperatorTerminalCandidate>, String> {
+    let palette = words
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if palette.is_empty() || palette.len() > 4 {
+        return Ok(None);
+    }
+    let bit_width = bit_width_for_cardinality(palette.len());
+    let index_by_word = palette
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, word)| (word, index as u8))
+        .collect::<BTreeMap<_, _>>();
+    let indices = words
+        .iter()
+        .map(|word| {
+            index_by_word
+                .get(word)
+                .copied()
+                .ok_or_else(|| "operator small-palette lookup failed".to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut payload = Vec::new();
+    payload.push(palette.len() as u8);
+    payload.push(bit_width);
+    for word in &palette {
+        payload.extend_from_slice(&word.to_le_bytes());
+    }
+    payload.extend_from_slice(&pack_indices(&indices, bit_width));
+    Ok(Some(OperatorTerminalCandidate {
+        mode: OperatorTerminalMode::SmallPalette,
+        payload,
+    }))
+}
+
+fn encode_operator_sparse_exceptions(
+    words: &[u64],
+) -> Result<Option<OperatorTerminalCandidate>, String> {
+    let counts = words
+        .iter()
+        .copied()
+        .fold(BTreeMap::new(), |mut map, word| {
+            *map.entry(word).or_insert(0_usize) += 1;
+            map
+        });
+    let Some((&dominant_word, &dominant_count)) = counts.iter().max_by_key(|(_, count)| **count)
+    else {
+        return Ok(None);
+    };
+    if dominant_count == words.len() {
+        return Ok(None);
+    }
+    let mut exception_positions = Vec::new();
+    let mut exception_values = Vec::new();
+    for (index, word) in words.iter().copied().enumerate() {
+        if word != dominant_word {
+            exception_positions.push(index);
+            exception_values.push(word);
+        }
+    }
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&dominant_word.to_le_bytes());
+    push_u16(&mut payload, exception_positions.len() as u16);
+    let position_bytes = encode_position_deltas(&exception_positions);
+    push_u32(&mut payload, position_bytes.len() as u32);
+    payload.extend_from_slice(&position_bytes);
+    for value in &exception_values {
+        payload.extend_from_slice(&value.to_le_bytes());
+    }
+    Ok(Some(OperatorTerminalCandidate {
+        mode: OperatorTerminalMode::SparseWordExceptions,
+        payload,
+    }))
 }
 
 fn candidate_steps() -> std::ops::Range<u8> {
@@ -967,9 +1356,30 @@ fn decode_operator_block(block: &OperatorBlock) -> Result<Vec<u8>, String> {
     if block.original_len as usize % 8 != 0 {
         return Err("operator block length must be divisible by 8".to_string());
     }
-    let constant = PackedConstantK::parse(&block.key)?;
-    let runtime = materialize_runtime(&constant, block.original_len as usize * 8)?;
-    expand_operator_block(&runtime, &block.seed, &block.branches)
+    if block.key.len() != 8 {
+        return Err("strict operator K must be exactly 8 bytes".to_string());
+    }
+    if block.steps == 0 {
+        return Err("strict operator step count must be non-zero".to_string());
+    }
+    let word_count = block.original_len as usize / 8;
+    let total_steps = word_count
+        .checked_mul(block.steps as usize)
+        .ok_or_else(|| "strict operator decoder step overflow".to_string())?;
+    if total_steps > MAX_DECODER_STEPS {
+        return Err("strict operator decoder gas limit exceeded".to_string());
+    }
+    let mut words = decode_operator_terminal(
+        block.terminal_mode,
+        &block.terminal_payload,
+        word_count,
+        block.original_len as usize,
+    )?;
+    let key = u64::from_le_bytes(block.key.clone().try_into().unwrap());
+    for _ in 0..block.steps {
+        apply_strict_operator_inverse_step(&mut words, key)?;
+    }
+    Ok(words.into_iter().flat_map(u64::to_le_bytes).collect())
 }
 
 fn build_trajectory_key(block: &[u8], steps: u8) -> Result<MagicKey, String> {
@@ -1175,6 +1585,112 @@ fn extract_spectral_block(block: &BlockEncoding) -> Option<&SpectralBlock> {
     }
 }
 
+fn extract_operator_block(block: &BlockEncoding) -> Option<&OperatorBlock> {
+    match block {
+        BlockEncoding::Operator(operator) => Some(operator),
+        _ => None,
+    }
+}
+
+fn decode_operator_terminal(
+    mode: OperatorTerminalMode,
+    payload: &[u8],
+    word_count: usize,
+    original_len: usize,
+) -> Result<Vec<u64>, String> {
+    match mode {
+        OperatorTerminalMode::UniformWord => {
+            if payload.len() != 8 {
+                return Err("uniform-word operator payload must be exactly 8 bytes".to_string());
+            }
+            let word = u64::from_le_bytes(payload.try_into().unwrap());
+            Ok(vec![word; word_count])
+        }
+        OperatorTerminalMode::SmallPalette => decode_operator_small_palette(payload, word_count),
+        OperatorTerminalMode::SparseWordExceptions => {
+            decode_operator_sparse_exceptions(payload, word_count)
+        }
+        OperatorTerminalMode::RawTerminal => {
+            if payload.len() != original_len {
+                return Err("raw operator terminal payload length is not canonical".to_string());
+            }
+            Ok(payload
+                .chunks_exact(8)
+                .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
+                .collect())
+        }
+    }
+}
+
+fn decode_operator_small_palette(payload: &[u8], word_count: usize) -> Result<Vec<u64>, String> {
+    if payload.len() < 2 {
+        return Err("operator small-palette payload is truncated".to_string());
+    }
+    let palette_len = payload[0] as usize;
+    let bit_width = payload[1];
+    if palette_len == 0 || palette_len > 4 {
+        return Err("operator small-palette length must be in 1..=4".to_string());
+    }
+    let table_bytes = palette_len
+        .checked_mul(8)
+        .ok_or_else(|| "operator small-palette table overflow".to_string())?;
+    if payload.len() < 2 + table_bytes {
+        return Err("operator small-palette table is truncated".to_string());
+    }
+    let palette = payload[2..2 + table_bytes]
+        .chunks_exact(8)
+        .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
+        .collect::<Vec<_>>();
+    let packed = &payload[2 + table_bytes..];
+    let expected_bytes = ceil_div_u64(word_count as u64 * bit_width as u64, 8) as usize;
+    if packed.len() != expected_bytes {
+        return Err("operator small-palette index payload length is not canonical".to_string());
+    }
+    let indices = unpack_indices(packed, bit_width, word_count)?;
+    indices
+        .into_iter()
+        .map(|index| {
+            palette
+                .get(index as usize)
+                .copied()
+                .ok_or_else(|| "operator small-palette index is out of range".to_string())
+        })
+        .collect()
+}
+
+fn decode_operator_sparse_exceptions(
+    payload: &[u8],
+    word_count: usize,
+) -> Result<Vec<u64>, String> {
+    if payload.len() < 14 {
+        return Err("operator sparse-exception payload is truncated".to_string());
+    }
+    let dominant_word = u64::from_le_bytes(payload[..8].try_into().unwrap());
+    let mut cursor = 8;
+    let exception_count = read_u16(payload, &mut cursor)? as usize;
+    let position_len = read_u32(payload, &mut cursor)? as usize;
+    let position_bytes = read_vec(payload, &mut cursor, position_len)?;
+    let positions = decode_position_deltas(&position_bytes)?;
+    if positions.len() != exception_count {
+        return Err("operator sparse-exception position count does not match header".to_string());
+    }
+    let expected_value_bytes = exception_count
+        .checked_mul(8)
+        .ok_or_else(|| "operator sparse-exception value length overflow".to_string())?;
+    let values = read_vec(payload, &mut cursor, expected_value_bytes)?;
+    if cursor != payload.len() {
+        return Err("operator sparse-exception payload has trailing bytes".to_string());
+    }
+    let mut out = vec![dominant_word; word_count];
+    for (position, chunk) in positions.iter().copied().zip(values.chunks_exact(8)) {
+        if position >= word_count {
+            return Err("operator sparse-exception position is out of range".to_string());
+        }
+        out[position] = u64::from_le_bytes(chunk.try_into().unwrap());
+    }
+    Ok(out)
+}
+
 fn pack_bools(bits: &[bool]) -> Vec<u8> {
     let values = bits.iter().map(|bit| u8::from(*bit)).collect::<Vec<_>>();
     pack_indices(&values, 1)
@@ -1185,6 +1701,10 @@ fn unpack_bools(bytes: &[u8], count: usize) -> Result<Vec<bool>, String> {
         .into_iter()
         .map(|value| value != 0)
         .collect())
+}
+
+fn hex_string(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn encoded_size_of(block: &BlockEncoding) -> usize {
@@ -1276,10 +1796,10 @@ fn append_serialized_block(out: &mut Vec<u8>, block: &BlockRecord) {
             push_u32(out, operator.original_len);
             push_u16(out, operator.key.len() as u16);
             out.extend_from_slice(&operator.key);
-            push_u32(out, operator.seed.len() as u32);
-            out.extend_from_slice(&operator.seed);
-            push_u32(out, operator.branches.len() as u32);
-            out.extend_from_slice(&operator.branches);
+            out.push(operator.steps);
+            out.push(operator.terminal_mode as u8);
+            push_u32(out, operator.terminal_payload.len() as u32);
+            out.extend_from_slice(&operator.terminal_payload);
         }
     }
 }
@@ -1499,18 +2019,31 @@ fn parse_archive(input: &[u8]) -> Result<Archive, String> {
             4 => {
                 let key_len = read_u16(input, &mut cursor)? as usize;
                 let key = read_vec(input, &mut cursor, key_len)?;
-                let constant = PackedConstantK::parse(&key)?;
-                let seed_len = read_u32(input, &mut cursor)? as usize;
-                let seed = read_vec(input, &mut cursor, seed_len)?;
-                let branch_len = read_u32(input, &mut cursor)? as usize;
-                let branches = read_vec(input, &mut cursor, branch_len)?;
-                let runtime = materialize_runtime(&constant, original_len as usize * 8)?;
-                expand_operator_block(&runtime, &seed, &branches)?;
+                if key.len() != 8 {
+                    return Err("strict operator K must be exactly 8 bytes".to_string());
+                }
+                let steps = read_u8(input, &mut cursor)?;
+                let terminal_mode = match read_u8(input, &mut cursor)? {
+                    0 => OperatorTerminalMode::UniformWord,
+                    1 => OperatorTerminalMode::SmallPalette,
+                    2 => OperatorTerminalMode::SparseWordExceptions,
+                    3 => OperatorTerminalMode::RawTerminal,
+                    _ => return Err("unknown operator terminal mode".to_string()),
+                };
+                let terminal_payload_len = read_u32(input, &mut cursor)? as usize;
+                let terminal_payload = read_vec(input, &mut cursor, terminal_payload_len)?;
+                decode_operator_terminal(
+                    terminal_mode,
+                    &terminal_payload,
+                    original_len as usize / 8,
+                    original_len as usize,
+                )?;
                 BlockEncoding::Operator(OperatorBlock {
                     original_len,
                     key,
-                    seed,
-                    branches,
+                    steps,
+                    terminal_mode,
+                    terminal_payload,
                 })
             }
             other => return Err(format!("unknown block mode: {other}")),
@@ -1701,18 +2234,20 @@ fn ensure_fully_consumed(input: &[u8], cursor: usize) -> Result<(), String> {
 #[cfg(test)]
 mod compact_codec_tests {
     use super::{
-        analyze_pass_band, compress_bytes, compress_bytes_generator_only_strict,
-        compress_bytes_with_outcome, compress_single_layer_bytes, decode_operator_block,
-        decompress_bytes, encoded_size_of, inspect_archive, parse_archive,
-        serialize_single_layer_archive, topology_score, try_encode_alphabet_block,
-        try_encode_operator_block, analyze_block, Archive, ArchiveHeader, BlockEncoding,
-        BlockRecord, OperatorBlock, PassWindowBand, RawBlock, MAGIC_MULTI,
-        SINGLE_LAYER_HEADER_BYTES,
+        analyze_block, analyze_pass_band, apply_strict_operator_step, compress_bytes,
+        compress_bytes_generator_only_strict, compress_bytes_with_outcome,
+        compress_single_layer_bytes, decode_operator_block, decompress_bytes, encoded_size_of,
+        inspect_archive, parse_archive, serialize_single_layer_archive, topology_score,
+        try_encode_alphabet_block, try_encode_operator_block, Archive, ArchiveHeader,
+        BlockEncoding, BlockRecord, CompressionProfile, OperatorBlock, PassWindowBand, RawBlock,
+        MAGIC_MULTI, SINGLE_LAYER_HEADER_BYTES,
     };
     use crate::domain::kernel::operator::{contract_block, expand_block, materialize_runtime};
     use crate::domain::kernel::topology::{
-        analyze_topology, compile_topology_to_constant, TopologySignature, WalshPeak, ShiftScore,
+        analyze_topology, compile_strict_operator_key, compile_topology_to_constant,
+        TopologySignature,
     };
+    use crate::domain::model::OperatorTerminalMode;
 
     #[test]
     fn roundtrip_ascii_and_binary_data() {
@@ -1775,12 +2310,12 @@ mod compact_codec_tests {
     #[test]
     fn pass_band_is_determined_per_stream_and_forms_a_dyadic_ladder() {
         let raw = vec![0xA5_u8; 4096];
-        let band0 = analyze_pass_band(&raw, None, 0).unwrap();
+        let band0 = analyze_pass_band(&raw, None, 0, CompressionProfile::General).unwrap();
         let sizes0 = super::window_sizes_for_band(band0).unwrap();
         assert!(sizes0.windows(2).all(|pair| pair[1] == pair[0] * 2));
 
         let packed = compress_bytes(&raw, None).unwrap();
-        let band1 = analyze_pass_band(&packed, None, 1).unwrap();
+        let band1 = analyze_pass_band(&packed, None, 1, CompressionProfile::General).unwrap();
         assert!(band1.max_window_bits <= band0.max_window_bits);
     }
 
@@ -1799,19 +2334,38 @@ mod compact_codec_tests {
     #[test]
     fn operator_block_wire_format_roundtrips_through_decoder() {
         let input = [0x5A_u8; 512];
-        let signature = analyze_topology(&input).unwrap();
-        let code = compile_topology_to_constant(&signature, input.len() * 8).unwrap();
-        let runtime = materialize_runtime(&code, input.len() * 8).unwrap();
-        let (seed, branches) = contract_block(&runtime, &input).unwrap();
-        let block = OperatorBlock {
-            original_len: input.len() as u32,
-            key: code.into_bytes(),
-            seed,
-            branches,
+        let block = match try_encode_operator_block(&input, None, CompressionProfile::General)
+            .unwrap()
+            .and_then(|candidate| match candidate {
+                BlockEncoding::Operator(block) => Some(block),
+                _ => None,
+            }) {
+            Some(block) => block,
+            None => {
+                let signature = analyze_topology(&input).unwrap();
+                let key_u64 = compile_strict_operator_key(&signature, input.len() * 8).unwrap();
+                let key = key_u64.to_le_bytes().to_vec();
+                let mut words = input
+                    .chunks_exact(8)
+                    .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
+                    .collect::<Vec<_>>();
+                apply_strict_operator_step(&mut words, key_u64).unwrap();
+                let payload = words
+                    .iter()
+                    .flat_map(|word| word.to_le_bytes())
+                    .collect::<Vec<_>>();
+                OperatorBlock {
+                    original_len: input.len() as u32,
+                    key,
+                    steps: 1,
+                    terminal_mode: OperatorTerminalMode::RawTerminal,
+                    terminal_payload: payload,
+                }
+            }
         };
         assert_eq!(decode_operator_block(&block).unwrap(), input);
-        assert!(block.key.len() > 8);
-        assert!(!block.seed.is_empty());
+        assert_eq!(block.key.len(), 8);
+        assert!(block.steps > 0);
     }
 
     #[test]
@@ -1829,8 +2383,9 @@ mod compact_codec_tests {
                 encoding: BlockEncoding::Operator(OperatorBlock {
                     original_len: 64,
                     key: vec![0; 7],
-                    seed: Vec::new(),
-                    branches: Vec::new(),
+                    steps: 1,
+                    terminal_mode: OperatorTerminalMode::RawTerminal,
+                    terminal_payload: vec![0; 64],
                 }),
             }],
         };
@@ -1879,7 +2434,7 @@ mod compact_codec_tests {
                 original_len: input.len() as u32,
                 payload: input.clone(),
             }),
-            try_encode_operator_block(&input, None)
+            try_encode_operator_block(&input, None, CompressionProfile::General)
                 .unwrap()
                 .unwrap_or(BlockEncoding::Raw(RawBlock {
                     original_len: input.len() as u32,
@@ -1988,7 +2543,10 @@ mod compact_codec_tests {
             .collect();
         let sig = crate::domain::kernel::topology::analyze_topology(&input).unwrap();
         let score = topology_score(&sig);
-        assert!(score.is_finite(), "topology_score must be finite for white noise");
+        assert!(
+            score.is_finite(),
+            "topology_score must be finite for white noise"
+        );
     }
 
     /// Alphabet encoding must return None for a single-symbol alphabet (bit_width == 0).
