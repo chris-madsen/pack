@@ -1,5 +1,6 @@
 use crate::domain::kernel::key::{
-    MagicKey, OperatorBlueprint, SpectralPeakCode, SpectralProgram, MAX_SPECTRAL_PEAKS,
+    BranchSchema, MagicKey, OperatorBlueprint, PipelineKind, ProgramCode, ProgramIR, ProgramStage,
+    SpectralPeakCode, SpectralProgram, StageOpcode, WindowClass, MAX_SPECTRAL_PEAKS,
 };
 use crate::domain::kernel::spectral::{normalized_fwht, strongest_walsh_peaks, SpectralPeak};
 
@@ -175,6 +176,106 @@ pub fn compile_topology_to_key(signature: &TopologySignature) -> Result<MagicKey
         derivative_density,
         popcnt_density,
         phase_parity,
+    })
+}
+
+pub fn compile_topology_to_program(
+    signature: &TopologySignature,
+    window_bits: usize,
+) -> Result<ProgramCode, String> {
+    if signature.bit_len != window_bits {
+        return Err("signature bit length does not match the selected window".to_string());
+    }
+    if signature.walsh_peaks.is_empty() || signature.shift_scores.is_empty() {
+        return Err("signature lacks required topology features".to_string());
+    }
+    let derivative_ones = signature.derivative.iter().filter(|bit| **bit == 1).count();
+    let derivative_density = derivative_ones as f64 / signature.derivative.len().max(1) as f64;
+    let spectral_prominence = signature.walsh_peaks[0].coefficient.abs()
+        / signature
+            .walsh_peaks
+            .iter()
+            .map(|peak| peak.coefficient.abs())
+            .sum::<f64>()
+            .max(1e-12);
+    let pipeline_kind = if spectral_prominence > 0.6 {
+        PipelineKind::Walsh
+    } else if derivative_density > 0.55 {
+        PipelineKind::Recurrence
+    } else {
+        PipelineKind::Hybrid
+    };
+    let window_class = if spectral_prominence > 0.7 {
+        WindowClass::MacroCoherent
+    } else if derivative_density > 0.65 {
+        WindowClass::LocalTransient
+    } else {
+        WindowClass::Balanced
+    };
+    let branch_schema = if derivative_density > 0.6 {
+        BranchSchema::ShiftParity
+    } else if spectral_prominence > 0.6 {
+        BranchSchema::PeakParity
+    } else {
+        BranchSchema::Mixed
+    };
+    let top0 = signature.walsh_peaks[0].index as u8;
+    let top1 = signature
+        .walsh_peaks
+        .get(1)
+        .map(|peak| peak.index as u8)
+        .unwrap_or(top0);
+    let shift0 = signature.shift_scores[0].shift as u8;
+    let shift1 = signature
+        .shift_scores
+        .get(1)
+        .map(|score| score.shift as u8)
+        .unwrap_or(shift0);
+    let branch_budget = if window_bits >= 4096 {
+        9
+    } else if window_bits >= 2048 {
+        5
+    } else if window_bits >= 1024 {
+        3
+    } else {
+        2
+    };
+
+    let mut stages = vec![
+        ProgramStage {
+            opcode: StageOpcode::HadamardAxis,
+            arg0: top0,
+            arg1: top1,
+        },
+        ProgramStage {
+            opcode: StageOpcode::GF2Recurrence,
+            arg0: shift0.max(1),
+            arg1: shift1,
+        },
+        ProgramStage {
+            opcode: StageOpcode::LanePermute,
+            arg0: (signature.popcnt_profile.len() as u8).max(1),
+            arg1: signature.popcnt_profile.first().copied().unwrap_or(0),
+        },
+    ];
+    for offset in 0..branch_budget {
+        stages.push(ProgramStage {
+            opcode: StageOpcode::BranchGate,
+            arg0: top0.wrapping_add(offset as u8),
+            arg1: shift0.wrapping_add(offset as u8),
+        });
+    }
+    stages.push(ProgramStage {
+        opcode: StageOpcode::Halt,
+        arg0: 0,
+        arg1: 0,
+    });
+
+    ProgramCode::from_ir(&ProgramIR {
+        pipeline_kind,
+        window_class,
+        branch_schema,
+        stages,
     })
 }
 

@@ -8,6 +8,139 @@ const SPECTRAL_AMPLITUDE_BITS: u64 = 5;
 const OPERATOR_INDEX_BITS: u64 = 12;
 const TRAJECTORY_STEP_BITS: u64 = 6;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PipelineKind {
+    Walsh = 0,
+    Recurrence = 1,
+    Hybrid = 2,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WindowClass {
+    MacroCoherent = 0,
+    Balanced = 1,
+    LocalTransient = 2,
+    ResidualDense = 3,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BranchSchema {
+    LowEntropy = 0,
+    PeakParity = 1,
+    ShiftParity = 2,
+    Mixed = 3,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StageOpcode {
+    HadamardAxis = 0,
+    PhaseProject = 1,
+    GF2Recurrence = 2,
+    OrbitFold = 3,
+    LanePermute = 4,
+    BranchGate = 5,
+    ParityProject = 6,
+    Halt = 7,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProgramStage {
+    pub opcode: StageOpcode,
+    pub arg0: u8,
+    pub arg1: u8,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProgramIR {
+    pub pipeline_kind: PipelineKind,
+    pub window_class: WindowClass,
+    pub branch_schema: BranchSchema,
+    pub stages: Vec<ProgramStage>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProgramCode {
+    bytes: Vec<u8>,
+}
+
+impl ProgramCode {
+    pub fn from_ir(program: &ProgramIR) -> Result<Self, String> {
+        validate_program_ir(program)?;
+        let mut bytes = Vec::with_capacity(2 + program.stages.len() * 3);
+        let header = (program.pipeline_kind as u8)
+            | ((program.window_class as u8) << 2)
+            | ((program.branch_schema as u8) << 4);
+        bytes.push(header);
+        bytes.push(program.stages.len() as u8);
+        for stage in &program.stages {
+            bytes.push(stage.opcode as u8);
+            bytes.push(stage.arg0);
+            bytes.push(stage.arg1);
+        }
+        Ok(Self { bytes })
+    }
+
+    pub fn parse(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() < 2 {
+            return Err("program code must contain a header and stage count".to_string());
+        }
+        let stage_count = usize::from(bytes[1]);
+        let expected = 2 + stage_count * 3;
+        if bytes.len() != expected {
+            return Err("program code length does not match its stage header".to_string());
+        }
+        let code = Self {
+            bytes: bytes.to_vec(),
+        };
+        code.program()?;
+        Ok(code)
+    }
+
+    pub fn program(&self) -> Result<ProgramIR, String> {
+        let header = *self
+            .bytes
+            .first()
+            .ok_or_else(|| "program code is empty".to_string())?;
+        let stage_count = usize::from(
+            *self
+                .bytes
+                .get(1)
+                .ok_or_else(|| "program code is missing the stage count".to_string())?,
+        );
+        let pipeline_kind = parse_pipeline_kind(header & 0b11)?;
+        let window_class = parse_window_class((header >> 2) & 0b11)?;
+        let branch_schema = parse_branch_schema((header >> 4) & 0b11)?;
+        let mut stages = Vec::with_capacity(stage_count);
+        for chunk in self.bytes[2..].chunks_exact(3) {
+            stages.push(ProgramStage {
+                opcode: parse_stage_opcode(chunk[0])?,
+                arg0: chunk[1],
+                arg1: chunk[2],
+            });
+        }
+        let program = ProgramIR {
+            pipeline_kind,
+            window_class,
+            branch_schema,
+            stages,
+        };
+        validate_program_ir(&program)?;
+        Ok(program)
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+
+    pub fn encoded_bit_len(&self) -> usize {
+        self.bytes.len() * 8
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum MagicKeyKind {
     Spectral,
@@ -282,6 +415,76 @@ fn parse_u64(bytes: &[u8]) -> Result<u64, String> {
     Ok(u64::from_le_bytes(encoded))
 }
 
+fn parse_pipeline_kind(raw: u8) -> Result<PipelineKind, String> {
+    match raw {
+        0 => Ok(PipelineKind::Walsh),
+        1 => Ok(PipelineKind::Recurrence),
+        2 => Ok(PipelineKind::Hybrid),
+        _ => Err("unsupported pipeline kind".to_string()),
+    }
+}
+
+fn parse_window_class(raw: u8) -> Result<WindowClass, String> {
+    match raw {
+        0 => Ok(WindowClass::MacroCoherent),
+        1 => Ok(WindowClass::Balanced),
+        2 => Ok(WindowClass::LocalTransient),
+        3 => Ok(WindowClass::ResidualDense),
+        _ => Err("unsupported window class".to_string()),
+    }
+}
+
+fn parse_branch_schema(raw: u8) -> Result<BranchSchema, String> {
+    match raw {
+        0 => Ok(BranchSchema::LowEntropy),
+        1 => Ok(BranchSchema::PeakParity),
+        2 => Ok(BranchSchema::ShiftParity),
+        3 => Ok(BranchSchema::Mixed),
+        _ => Err("unsupported branch schema".to_string()),
+    }
+}
+
+fn parse_stage_opcode(raw: u8) -> Result<StageOpcode, String> {
+    match raw {
+        0 => Ok(StageOpcode::HadamardAxis),
+        1 => Ok(StageOpcode::PhaseProject),
+        2 => Ok(StageOpcode::GF2Recurrence),
+        3 => Ok(StageOpcode::OrbitFold),
+        4 => Ok(StageOpcode::LanePermute),
+        5 => Ok(StageOpcode::BranchGate),
+        6 => Ok(StageOpcode::ParityProject),
+        7 => Ok(StageOpcode::Halt),
+        _ => Err("unsupported stage opcode".to_string()),
+    }
+}
+
+fn validate_program_ir(program: &ProgramIR) -> Result<(), String> {
+    if program.stages.is_empty() {
+        return Err("program must contain at least one stage".to_string());
+    }
+    if program.stages.len() > usize::from(u8::MAX) {
+        return Err("program exceeds the serialisable stage budget".to_string());
+    }
+    if !matches!(
+        program.stages.last(),
+        Some(ProgramStage {
+            opcode: StageOpcode::Halt,
+            ..
+        })
+    ) {
+        return Err("program must terminate with Halt".to_string());
+    }
+    if program
+        .stages
+        .iter()
+        .take(program.stages.len().saturating_sub(1))
+        .any(|stage| stage.opcode == StageOpcode::Halt)
+    {
+        return Err("Halt may only appear as the last stage".to_string());
+    }
+    Ok(())
+}
+
 fn validate_spectral_program(program: &SpectralProgram) -> Result<(), String> {
     if program.bit_len == 0 || !program.bit_len.is_power_of_two() {
         return Err("spectral bit_len must be a non-zero power of two".to_string());
@@ -404,5 +607,91 @@ mod tests {
         let mut bp = sample_operator_blueprint();
         bp.peak_indices[0] = 4096;
         assert!(OperatorKey::from_blueprint(&bp).is_err());
+    }
+
+    #[test]
+    fn variable_length_program_code_roundtrips_through_ir() {
+        let program = ProgramIR {
+            pipeline_kind: PipelineKind::Hybrid,
+            window_class: WindowClass::Balanced,
+            branch_schema: BranchSchema::Mixed,
+            stages: vec![
+                ProgramStage {
+                    opcode: StageOpcode::HadamardAxis,
+                    arg0: 17,
+                    arg1: 2,
+                },
+                ProgramStage {
+                    opcode: StageOpcode::BranchGate,
+                    arg0: 11,
+                    arg1: 0,
+                },
+                ProgramStage {
+                    opcode: StageOpcode::Halt,
+                    arg0: 0,
+                    arg1: 0,
+                },
+            ],
+        };
+        let code = ProgramCode::from_ir(&program).unwrap();
+        assert_eq!(
+            ProgramCode::parse(code.as_bytes())
+                .unwrap()
+                .program()
+                .unwrap(),
+            program
+        );
+        assert_eq!(code.encoded_bit_len(), code.as_bytes().len() * 8);
+    }
+
+    #[test]
+    fn changing_stage_order_changes_the_magic_program_code() {
+        let left = ProgramCode::from_ir(&ProgramIR {
+            pipeline_kind: PipelineKind::Hybrid,
+            window_class: WindowClass::Balanced,
+            branch_schema: BranchSchema::Mixed,
+            stages: vec![
+                ProgramStage {
+                    opcode: StageOpcode::HadamardAxis,
+                    arg0: 9,
+                    arg1: 1,
+                },
+                ProgramStage {
+                    opcode: StageOpcode::BranchGate,
+                    arg0: 7,
+                    arg1: 0,
+                },
+                ProgramStage {
+                    opcode: StageOpcode::Halt,
+                    arg0: 0,
+                    arg1: 0,
+                },
+            ],
+        })
+        .unwrap();
+        let right = ProgramCode::from_ir(&ProgramIR {
+            pipeline_kind: PipelineKind::Hybrid,
+            window_class: WindowClass::Balanced,
+            branch_schema: BranchSchema::Mixed,
+            stages: vec![
+                ProgramStage {
+                    opcode: StageOpcode::BranchGate,
+                    arg0: 7,
+                    arg1: 0,
+                },
+                ProgramStage {
+                    opcode: StageOpcode::HadamardAxis,
+                    arg0: 9,
+                    arg1: 1,
+                },
+                ProgramStage {
+                    opcode: StageOpcode::Halt,
+                    arg0: 0,
+                    arg1: 0,
+                },
+            ],
+        })
+        .unwrap();
+        assert_ne!(left.as_bytes(), right.as_bytes());
     }
 }

@@ -10,7 +10,8 @@ pub enum BlockMode {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LayerSummary {
-    pub block_size_bytes: u32,
+    pub window_min_bits: u32,
+    pub window_max_bits: u32,
     pub input_size: u64,
     pub output_size: u64,
 }
@@ -18,9 +19,16 @@ pub struct LayerSummary {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ArchiveHeader {
     pub base_version: u8,
-    pub block_size_bytes: u32,
+    pub window_min_exp: u8,
+    pub window_max_exp: u8,
     pub original_size: u64,
     pub block_count: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlockRecord {
+    pub window_index: u8,
+    pub encoding: BlockEncoding,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -69,10 +77,8 @@ pub struct TrajectoryBlock {
 pub struct OperatorBlock {
     pub original_len: u32,
     pub key: Vec<u8>,
-    pub terminals: Vec<u64>,
-    pub terminal_indices: Vec<u8>,
-    pub steps: u8,
-    pub breadcrumbs: Vec<u8>,
+    pub seed: Vec<u8>,
+    pub branches: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -101,12 +107,18 @@ impl BlockEncoding {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Archive {
     pub header: ArchiveHeader,
-    pub blocks: Vec<BlockEncoding>,
+    pub blocks: Vec<BlockRecord>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BlockAnalysis {
     pub unique_sorted_bytes: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PassWindowBand {
+    pub min_window_bits: u32,
+    pub max_window_bits: u32,
 }
 
 #[derive(Clone, Debug, PartialEq)]

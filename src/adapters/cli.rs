@@ -50,7 +50,7 @@ fn run_benchmark(args: &[String]) -> Result<(), String> {
         let block_sizes = report
             .layer_summaries
             .iter()
-            .map(|item| item.block_size_bytes.to_string())
+            .map(|item| format!("{}-{}", item.window_min_bits, item.window_max_bits))
             .collect::<Vec<_>>()
             .join(">");
         println!(
@@ -83,7 +83,7 @@ fn run_benchmark_generator(args: &[String]) -> Result<(), String> {
         let block_sizes = report
             .layer_summaries
             .iter()
-            .map(|item| item.block_size_bytes.to_string())
+            .map(|item| format!("{}-{}", item.window_min_bits, item.window_max_bits))
             .collect::<Vec<_>>()
             .join(">");
         println!(

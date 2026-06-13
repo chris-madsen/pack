@@ -1,3 +1,4 @@
+use crate::domain::kernel::key::{ProgramCode, ProgramIR, ProgramStage, StageOpcode};
 use crate::domain::kernel::reversible::{
     feistel_forward, feistel_inverse, FeistelKey, FeistelRoundKey,
 };
@@ -53,6 +54,129 @@ pub struct BinaryWordPeak {
     pub bit: u8,
     pub positive: bool,
     pub bias: u16,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimePipeline {
+    pub program: ProgramIR,
+    pub window_bits: usize,
+}
+
+pub fn materialize_runtime(
+    code: &ProgramCode,
+    window_bits: usize,
+) -> Result<RuntimePipeline, String> {
+    if window_bits == 0 || !window_bits.is_power_of_two() {
+        return Err("runtime window must be a non-zero power of two".to_string());
+    }
+    if window_bits % 64 != 0 {
+        return Err("runtime window must be divisible by 64 bits".to_string());
+    }
+    Ok(RuntimePipeline {
+        program: code.program()?,
+        window_bits,
+    })
+}
+
+pub fn contract_block(
+    runtime: &RuntimePipeline,
+    block: &[u8],
+) -> Result<(Vec<u8>, Vec<u8>), String> {
+    if block.len() * 8 != runtime.window_bits {
+        return Err("runtime window does not match block length".to_string());
+    }
+    if block.len() % 8 != 0 {
+        return Err("runtime block must be divisible by 8 bytes".to_string());
+    }
+    let mut words = block
+        .chunks_exact(8)
+        .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
+        .collect::<Vec<_>>();
+    let mut live_bits = 64_usize;
+    let mut branches = Vec::new();
+    for stage in &runtime.program.stages {
+        match stage.opcode {
+            StageOpcode::HadamardAxis => apply_stage_hadamard_axis(&mut words, live_bits, *stage),
+            StageOpcode::PhaseProject => apply_stage_phase_project(&mut words, live_bits, *stage),
+            StageOpcode::GF2Recurrence => {
+                apply_stage_gf2_recurrence(&mut words, live_bits, *stage)?
+            }
+            StageOpcode::OrbitFold => apply_stage_orbit_fold(&mut words, live_bits, *stage),
+            StageOpcode::LanePermute => apply_stage_lane_permute(&mut words, *stage),
+            StageOpcode::BranchGate => {
+                if live_bits <= 1 {
+                    return Err("branch gate exhausted the word bit budget".to_string());
+                }
+                for (index, word) in words.iter_mut().enumerate() {
+                    let position = branch_position(*stage, index, live_bits);
+                    branches.push(((word.to_owned() >> position) & 1) == 1);
+                    *word = remove_bit_at(*word, position);
+                    *word &= word_mask(live_bits - 1);
+                }
+                live_bits -= 1;
+            }
+            StageOpcode::ParityProject => apply_stage_parity_project(&mut words, live_bits, *stage),
+            StageOpcode::Halt => break,
+        }
+    }
+    let seed = pack_words_with_width(&words, live_bits);
+    Ok((seed, pack_bools_local(&branches)))
+}
+
+pub fn expand_block(
+    runtime: &RuntimePipeline,
+    seed: &[u8],
+    branches: &[u8],
+) -> Result<Vec<u8>, String> {
+    let total_branch_gates = runtime
+        .program
+        .stages
+        .iter()
+        .filter(|stage| stage.opcode == StageOpcode::BranchGate)
+        .count();
+    if total_branch_gates >= 64 {
+        return Err("program contains too many branch gates".to_string());
+    }
+    let final_live_bits = 64 - total_branch_gates;
+    let word_count = runtime.window_bits / 64;
+    let mut words = unpack_words_with_width(seed, word_count, final_live_bits)?;
+    let branch_count = total_branch_gates
+        .checked_mul(word_count)
+        .ok_or_else(|| "branch count overflow".to_string())?;
+    let crumbs = unpack_bools_local(branches, branch_count)?;
+    let mut branch_cursor = crumbs.len();
+    let mut live_bits = final_live_bits;
+    for stage in runtime.program.stages.iter().rev() {
+        match stage.opcode {
+            StageOpcode::Halt => {}
+            StageOpcode::ParityProject => apply_stage_parity_project(&mut words, live_bits, *stage),
+            StageOpcode::BranchGate => {
+                live_bits += 1;
+                for index in (0..words.len()).rev() {
+                    branch_cursor = branch_cursor
+                        .checked_sub(1)
+                        .ok_or_else(|| "branch log underflow".to_string())?;
+                    let position = branch_position(*stage, index, live_bits);
+                    words[index] = insert_bit_at(words[index], position, crumbs[branch_cursor]);
+                    words[index] &= word_mask(live_bits);
+                }
+            }
+            StageOpcode::LanePermute => apply_stage_lane_permute_inverse(&mut words, *stage),
+            StageOpcode::OrbitFold => apply_stage_orbit_fold(&mut words, live_bits, *stage),
+            StageOpcode::GF2Recurrence => {
+                apply_stage_gf2_recurrence_inverse(&mut words, live_bits, *stage)?
+            }
+            StageOpcode::PhaseProject => apply_stage_phase_project(&mut words, live_bits, *stage),
+            StageOpcode::HadamardAxis => apply_stage_hadamard_axis(&mut words, live_bits, *stage),
+        }
+    }
+    if branch_cursor != 0 {
+        return Err("branch log contains trailing bits".to_string());
+    }
+    Ok(words
+        .into_iter()
+        .flat_map(u64::to_le_bytes)
+        .collect::<Vec<_>>())
 }
 
 pub fn apply_phase_reflection(values: &mut [f64], key: &PhaseKey) -> Result<(), String> {
@@ -218,6 +342,200 @@ pub fn default_feistel_from_seed(seed: u64, rounds: u8) -> FeistelKey {
         });
     }
     FeistelKey { rounds: keys }
+}
+
+fn apply_stage_hadamard_axis(words: &mut [u64], live_bits: usize, stage: ProgramStage) {
+    let live_mask = word_mask(live_bits);
+    for (index, word) in words.iter_mut().enumerate() {
+        let bit = ((usize::from(stage.arg0) + index * (usize::from(stage.arg1) + 1))
+            % live_bits.max(1)) as u32;
+        *word ^= 1_u64 << bit;
+        *word &= live_mask;
+    }
+}
+
+fn apply_stage_phase_project(words: &mut [u64], live_bits: usize, stage: ProgramStage) {
+    let live_mask = word_mask(live_bits);
+    let mask = repeat_byte(stage.arg0).rotate_left(u32::from(stage.arg1));
+    for word in words.iter_mut() {
+        *word ^= mask & live_mask;
+    }
+}
+
+fn apply_stage_gf2_recurrence(
+    words: &mut [u64],
+    live_bits: usize,
+    stage: ProgramStage,
+) -> Result<(), String> {
+    let shift = shift_from_stage(stage, live_bits)?;
+    let live_mask = word_mask(live_bits);
+    for word in words.iter_mut() {
+        *word ^= (*word >> shift) & live_mask;
+        *word &= live_mask;
+    }
+    Ok(())
+}
+
+fn apply_stage_gf2_recurrence_inverse(
+    words: &mut [u64],
+    live_bits: usize,
+    stage: ProgramStage,
+) -> Result<(), String> {
+    let shift = shift_from_stage(stage, live_bits)?;
+    let live_mask = word_mask(live_bits);
+    for word in words.iter_mut() {
+        let mut restored = *word & live_mask;
+        let mut delta = shift;
+        while delta < live_bits {
+            restored ^= restored >> delta;
+            restored &= live_mask;
+            delta *= 2;
+        }
+        *word = restored;
+    }
+    Ok(())
+}
+
+fn apply_stage_orbit_fold(words: &mut [u64], live_bits: usize, stage: ProgramStage) {
+    let live_mask = word_mask(live_bits);
+    let mask = repeat_byte(stage.arg1).rotate_left(u32::from(stage.arg0));
+    for (index, word) in words.iter_mut().enumerate() {
+        *word ^= mask.rotate_left((index as u32 + u32::from(stage.arg0)) & 63) & live_mask;
+        *word &= live_mask;
+    }
+}
+
+fn apply_stage_lane_permute(words: &mut [u64], stage: ProgramStage) {
+    if words.is_empty() {
+        return;
+    }
+    let rotate = usize::from(stage.arg0) % words.len();
+    words.rotate_left(rotate);
+}
+
+fn apply_stage_lane_permute_inverse(words: &mut [u64], stage: ProgramStage) {
+    if words.is_empty() {
+        return;
+    }
+    let rotate = usize::from(stage.arg0) % words.len();
+    words.rotate_right(rotate);
+}
+
+fn apply_stage_parity_project(words: &mut [u64], live_bits: usize, stage: ProgramStage) {
+    let live_mask = word_mask(live_bits);
+    let mask = repeat_byte(stage.arg0 ^ stage.arg1).rotate_left(7);
+    for (index, word) in words.iter_mut().enumerate() {
+        let parity = ((word.count_ones() + index as u32) & 1) as u64;
+        *word ^= (mask & live_mask) * parity;
+        *word &= live_mask;
+    }
+}
+
+fn shift_from_stage(stage: ProgramStage, live_bits: usize) -> Result<usize, String> {
+    let shift = usize::from(stage.arg0 % (live_bits as u8).max(2)).max(1);
+    if shift >= live_bits {
+        return Err("gf2 recurrence shift exceeds the live word width".to_string());
+    }
+    Ok(shift)
+}
+
+fn branch_position(stage: ProgramStage, word_index: usize, live_bits: usize) -> usize {
+    (usize::from(stage.arg0) + word_index * (usize::from(stage.arg1) + 1)) % live_bits.max(1)
+}
+
+fn word_mask(live_bits: usize) -> u64 {
+    if live_bits >= 64 {
+        u64::MAX
+    } else if live_bits == 0 {
+        0
+    } else {
+        (1_u64 << live_bits) - 1
+    }
+}
+
+fn remove_bit_at(value: u64, position: usize) -> u64 {
+    let low_mask = if position == 0 {
+        0
+    } else {
+        (1_u64 << position) - 1
+    };
+    let low = value & low_mask;
+    let high = if position >= 63 {
+        0
+    } else {
+        value >> (position + 1)
+    };
+    low | (high << position)
+}
+
+fn insert_bit_at(value: u64, position: usize, bit: bool) -> u64 {
+    let low_mask = if position == 0 {
+        0
+    } else {
+        (1_u64 << position) - 1
+    };
+    let low = value & low_mask;
+    let high = if position >= 63 { 0 } else { value >> position };
+    low | (u64::from(bit) << position)
+        | if position >= 63 {
+            0
+        } else {
+            high << (position + 1)
+        }
+}
+
+fn pack_words_with_width(words: &[u64], live_bits: usize) -> Vec<u8> {
+    let bytes_per_word = live_bits.div_ceil(8);
+    let mut out = Vec::with_capacity(words.len() * bytes_per_word);
+    for word in words {
+        out.extend_from_slice(&word.to_le_bytes()[..bytes_per_word]);
+    }
+    out
+}
+
+fn unpack_words_with_width(
+    bytes: &[u8],
+    word_count: usize,
+    live_bits: usize,
+) -> Result<Vec<u64>, String> {
+    let bytes_per_word = live_bits.div_ceil(8);
+    let expected = word_count
+        .checked_mul(bytes_per_word)
+        .ok_or_else(|| "seed length overflow".to_string())?;
+    if bytes.len() != expected {
+        return Err("seed length does not match the live word width".to_string());
+    }
+    let mut words = Vec::with_capacity(word_count);
+    for chunk in bytes.chunks_exact(bytes_per_word) {
+        let mut encoded = [0_u8; 8];
+        encoded[..bytes_per_word].copy_from_slice(chunk);
+        words.push(u64::from_le_bytes(encoded) & word_mask(live_bits));
+    }
+    Ok(words)
+}
+
+fn pack_bools_local(bits: &[bool]) -> Vec<u8> {
+    let mut out = vec![0_u8; bits.len().div_ceil(8)];
+    for (index, bit) in bits.iter().enumerate() {
+        if *bit {
+            out[index / 8] |= 1 << (index % 8);
+        }
+    }
+    out
+}
+
+fn unpack_bools_local(bytes: &[u8], count: usize) -> Result<Vec<bool>, String> {
+    let expected = count.div_ceil(8);
+    if bytes.len() != expected {
+        return Err("branch-log length does not match the expected bit count".to_string());
+    }
+    Ok((0..count)
+        .map(|index| ((bytes[index / 8] >> (index % 8)) & 1) == 1)
+        .collect())
+}
+
+fn repeat_byte(byte: u8) -> u64 {
+    u64::from_le_bytes([byte; 8])
 }
 
 fn phase_bit(index: u64, key: &PhaseKey) -> u8 {
