@@ -1,105 +1,80 @@
-# Аудит текущей реализации `pack`
+# Implementation Audit
 
-**Дата:** 2026-06-12  
-**Вывод:** текущий Rust-код является диагностическим контейнером с alphabet-кодеком, но не реализацией целевого метагенератора из `TZ.md`.
+**Date:** 2026-06-13
+**Scope:** remediation of `docs/review-claude.md`
 
-## 1. Что реально реализовано
+## Implemented execution path
 
-- lossless `pack/unpack`;
-- бинарный однослойный и рекурсивный контейнер;
-- выбор размера блока по минимальному фактическому размеру среди нескольких вариантов;
-- повторные слои, пока полный архив уменьшается;
-- alphabet-кодек: алфавит блока хранится как параметры, а каждый байт кодируется индексом;
-- raw fallback;
-- строгая проверка версий, размеров, хвостовых байтов и цепочки слоёв.
-
-## 2. Что заявлено в ТЗ, но отсутствует
-
-| Требование | Статус |
-|---|---|
-| `U_K = F_K⁻¹ · H · D_K · H · F_K` | отсутствует |
-| применение одного оператора для упаковки и распаковки | отсутствует |
-| FWHT / Walsh–Hadamard analyzer | отсутствует |
-| `F_K` на ARX/Feistel/xorshift/rotate/odd-mul | отсутствует |
-| `D_K` и фазовая функция | отсутствует |
-| гибридный `KHeader + SegmentDirectory + SegmentPayloads` | отсутствует |
-| генерация битового алгоритма из топологии блока | отсутствует |
-| Walsh-пики, производные, shift-correlation, popcnt-profile | отсутствуют |
-| `V` как траектория ветвлений обратного хода | отсутствует |
-| ограничение `K <= 512 бит` | не контролируется |
-| критерий `|K| + |V| + overhead << |N|` как hard constraint | не обеспечивается |
-| заранее согласованная исполнимая база `B_STD` | отсутствует |
-| файловая/слойная база `B_FILE/B_LAYER` | отсутствует |
-
-## 3. Почему текущий результат на noise равен примерно 12%
-
-Для `tests/noise/noise_01.txt`:
+The operator path is now:
 
 ```text
-N                 = 29 722 байта
-мощность алфавита = 66
-ширина индекса    = ceil(log2(66)) = 7 бит
-V                 = 29 722 × 7 = 208 054 бит = 26 007 байт
-V / N             = 87.5%
+block
+  -> topology analysis over the complete block
+  -> compact K (<= 512 bits)
+  -> exact self-inverse word-level U_K
+  -> shared terminal + parity trajectory V
+  -> strict K + V + overhead budget
 ```
 
-Текущие параметры, условно выполняющие роль `K`:
+`K` contains five canonical segments:
+
+1. `RevMix`
+2. `PhaseMask`
+3. `WalshConfig`
+4. `Program`
+5. `AuxConst`
+
+The decoder reads and uses every segment. `Program` contains operation codes
+from the versioned shared base. Directly irreversible instructions are rejected.
+
+## Review remediation
+
+| Review finding | Remediation | Regression tests |
+|---|---|---|
+| `OperationCode` and generated base were decorative | Generated schedules execute through `GeneratedBase::apply_forward/apply_inverse`; codec parses and executes `Program` | `generated_base_schedule_is_executable_and_reversible`, `changing_generated_schedule_changes_execution`, `every_operator_key_segment_changes_executable_output` |
+| Magic key did not describe an algorithm | Added canonical `Program` segment; program length equals `K.header.rounds`; all instructions are validated | `hybrid_k_roundtrips_canonically_and_is_versioned`, `operator_program_rejects_non_reversible_direct_operations` |
+| Operator parameters were hard-coded | `build_operator_codec_key` is now exactly `analyze_topology -> compile_topology_to_key` | `changing_block_topology_changes_compiled_k`, `every_topology_profile_materially_changes_compiled_k` |
+| Seed used only the first eight bytes | `AuxConst` uses a fingerprint folded over every block chunk | `block_fingerprint_depends_on_the_entire_block`, `operator_key_depends_on_the_entire_block_not_only_its_prefix` |
+| XorShift predictor ignored Walsh data | Removed the standalone XorShift predictor and duplicate spectral encoder; predictor generation executes `Program`, Feistel, and `U_K` | `every_operator_key_segment_changes_executable_output`, `spectral_block_roundtrips_through_real_archive` |
+| Operator accepted only exact synthetic matches except one bit | Operator applies exact `U_K`, records a shared terminal as overhead, and stores only parity branch bits in `V` | `real_operator_word_u_k_is_an_involution`, `operator_v_is_a_parity_trajectory_inside_the_u_k_path`, `operator_archive_rejects_noncanonical_parity_stream` |
+| Zero-valued minimal spectral fallback | Removed | covered by the absence of a fallback path and topology-key tests |
+| Popcount data was serialized and ignored | Popcount contributes to program synthesis and multiplier selection | `every_topology_profile_materially_changes_compiled_k` |
+| Spectrum/derivative hashes were used as opaque parameters | Removed those fields; semantic features select masks, shifts, multipliers, and the program | `topology_compiler_is_deterministic_and_uses_all_required_profiles` |
+| Feistel was dead code | Codec predictor generation calls `feistel_forward` in both state preparation and output generation | `every_operator_key_segment_changes_executable_output`, Feistel unit tests |
+| Synthetic `>=10x` tests hid poor external results | Removed all codec-generated quality fixtures; quality is measured through CLI benchmarks | `docs/test-contract-matrix.md` |
+
+## Current measured quality
+
+Release benchmark command:
+
+```bash
+target/release/pack benchmark tests/noise
+```
+
+Results for each of 15 files:
 
 ```text
-alphabet_len + bit_width + alphabet = 68 байт = 544 бита
+29,722 bytes -> 26,158 bytes
+packed/original = 0.8801
+compression factor = 1.1362x
+roundtrip = true
 ```
 
-Таким образом, этот кодек конструктивно не может дать многократное сжатие base64-шума: он сохраняет 7 из 8 бит каждого входного байта. Это не ошибка настройки размера блока, а ограничение самого паттерна.
-
-## 4. Найденные и исправленные программные ошибки
-
-1. `4096 бит` были ошибочно реализованы как `4096 байт`.
-2. Слой принимался по локальному выигрышу без учёта root-overhead.
-3. Алфавит из одного символа создавал ненужный бит `V` на каждый символ.
-4. Версия базы читалась, но не проверялась.
-5. Метаданные размеров рекурсивных слоёв не проверялись декодером.
-6. Принимались архивы с хвостовыми байтами.
-7. Raw-блок мог иметь несовпадающие `original_len` и `payload_len`.
-8. Не проверялась каноничность алфавита, ширины индекса и длины `V`.
-
-На эти случаи добавлены модульные тесты в `src/domain/bitstream.rs` и `src/domain/codec.rs`.
-
-## 5. Как сейчас выбирается размер блока
-
-Текущий код не выводит размер блока из спектра. Он пробует конечный набор:
+Additional external files:
 
 ```text
-hint/4, hint/2, hint, hint*2, hint*4, whole_input
+test1.txt: 24,465 -> 10,963 bytes, 2.2316x, roundtrip=true
+test2.txt: 22,673 -> 10,178 bytes, 2.2276x, roundtrip=true
 ```
 
-и выбирает минимальный фактический архив. Это ограниченный перебор размеров, а не топологическая компиляция из ТЗ.
+The target `>=10x` result is **not achieved**. The current noise result is still
+produced by the alphabet strategy; the executable operator path is now real but
+does not yet synthesize a sufficiently short `V` for this corpus.
 
-## 6. Что необходимо реализовать дальше
+## Remaining research gap
 
-1. Зафиксировать ADT формальной базы `B_STD` и формат реального `K`.
-2. Реализовать FWHT для блока 4096 бит.
-3. Реализовать анализ:
-   - Walsh-пики;
-   - битовые производные;
-   - shift-correlation;
-   - popcnt-profile.
-4. Реализовать детерминированный `Topology -> K` compiler без перебора функций.
-5. Реализовать обратимый `F_K` на Feistel/ARX.
-6. Реализовать `D_K` и оператор:
-
-   ```text
-   U_K = F_K⁻¹ · H · D_K · H · F_K
-   ```
-
-7. Добавить обязательный тест:
-
-   ```text
-   U_K(U_K(X)) = X
-   ```
-
-   для всех генерируемых классов `K`.
-8. Реализовать траекторный `V`, а не прямые индексы каждого символа.
-9. Ввести измерение `K_bits`, `V_bits`, `overhead_bits` на каждый блок.
-10. Запрещать принятие блока, не выполняющего установленный hard constraint.
-
-До выполнения этих пунктов коэффициент alphabet-кодека нельзя использовать как оценку перспективности целевого алгоритма.
+The code no longer fakes operator execution or substitutes an XOR residual for
+parity breadcrumbs. The metagenerator still needs a stronger constructive rule
+that maps arbitrary external blocks to an executable program whose transformed
+words share a short trajectory. Adding format-specific predictors or generating
+test data from the decoder is not an acceptable solution.

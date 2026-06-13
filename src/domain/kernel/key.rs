@@ -9,7 +9,7 @@ pub enum SegmentKind {
     RevMix = 0x01,
     PhaseMask = 0x02,
     WalshConfig = 0x03,
-    CrumbConfig = 0x04,
+    Program = 0x04,
     AuxConst = 0x05,
 }
 
@@ -21,7 +21,7 @@ impl TryFrom<u8> for SegmentKind {
             0x01 => Ok(Self::RevMix),
             0x02 => Ok(Self::PhaseMask),
             0x03 => Ok(Self::WalshConfig),
-            0x04 => Ok(Self::CrumbConfig),
+            0x04 => Ok(Self::Program),
             0x05 => Ok(Self::AuxConst),
             _ => Err(format!("unknown K segment kind: {value}")),
         }
@@ -212,8 +212,8 @@ mod tests {
                     payload: vec![1, 2, 3],
                 },
                 KeySegment {
-                    kind: SegmentKind::CrumbConfig,
-                    payload: vec![1],
+                    kind: SegmentKind::Program,
+                    payload: vec![1, 2, 4, 8],
                 },
             ],
         }

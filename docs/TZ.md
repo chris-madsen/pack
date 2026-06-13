@@ -1136,3 +1136,40 @@ X -> part_1 + part_2 + part_3 + ...
 - первый операторный паттерн — `U_K = F_K⁻¹ · H · D_K · H · F_K`;
 - MVP работает на фиксированном блоке 4096 бит;
 - adaptive block sizing выносится в следующую фазу.
+
+---
+
+## Appendix C. Executable K amendment (implemented 2026-06-13)
+
+The current MVP encodes the operator algorithm in five canonical `K` segments:
+
+```text
+RevMix | PhaseMask | WalshConfig | Program | AuxConst
+```
+
+- `Program` is an ordered sequence of operation codes from versioned `B_STD`.
+- `AuxConst` is derived from the complete block, not from a fixed prefix.
+- Walsh peaks, shift correlation, bit derivative, and popcount profile all
+  influence compilation.
+- The runtime validates every instruction and rejects directly irreversible
+  operations outside a Feistel/phase context.
+- Operator execution uses exact word-level
+  `U_K = F_K^-1 · H^-1 · D_K · H · F_K`.
+- The shared terminal is explicit overhead.
+- Operator `V` is only the canonical parity/branch stream consumed by the
+  reverse trajectory; it is not an XOR residual.
+- A block is accepted only when `K + V + overhead` satisfies the configured
+  strict compression budget.
+
+The former zero-valued spectral fallback and codec-generated `>=10x` quality
+fixtures are forbidden. Compression quality must be reported on external files.
+
+Current external noise result:
+
+```text
+29,722 bytes -> 26,158 bytes
+compression factor = 1.1362x
+```
+
+Therefore the executable-path integration is complete, while the `>=10x`
+metagenerator quality objective remains open.

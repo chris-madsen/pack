@@ -2,6 +2,10 @@
 name = "pack"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.73"
+description = "Research lossless codec with topology-compiled executable keys"
+readme = "README.md"
+publish = false
 
 [lib]
 name = "pack"

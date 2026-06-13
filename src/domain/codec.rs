@@ -3,14 +3,22 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::domain::bitstream::{
     bit_width_for_cardinality, ceil_div_u64, pack_indices, unpack_indices,
 };
+use crate::domain::kernel::base::{
+    standard_base, GeneratedBase, OperationCode, RootSeed, SafetyClass,
+};
 use crate::domain::kernel::budget::{BitBudget, CompressionPolicy};
 use crate::domain::kernel::key::{KeySegment, MagicKey, SegmentKind};
 use crate::domain::kernel::operator::{apply_u_k, IndexMix, PhaseKey, SpectralOperatorKey};
-use crate::domain::kernel::trajectory::{decode_parity_trajectory, encode_parity_trajectory, ParityTrajectory};
+use crate::domain::kernel::reversible::{
+    feistel_forward, feistel_inverse, FeistelKey, FeistelRoundKey,
+};
 use crate::domain::kernel::topology::{analyze_topology, compile_topology_to_key};
+use crate::domain::kernel::trajectory::{
+    decode_parity_trajectory, encode_parity_trajectory, ParityTrajectory,
+};
 use crate::domain::model::{
-    AlphabetBlock, Archive, ArchiveHeader, BlockAnalysis, BlockEncoding, LayerSummary, RawBlock,
-    OperatorBlock, SpectralBlock, TrajectoryBlock,
+    AlphabetBlock, Archive, ArchiveHeader, BlockAnalysis, BlockEncoding, LayerSummary,
+    OperatorBlock, RawBlock, SpectralBlock, TrajectoryBlock,
 };
 
 const MAGIC_SINGLE: &[u8; 8] = b"PACKMVP1";
@@ -125,7 +133,6 @@ fn encode_block(block: &[u8]) -> Result<BlockEncoding, String> {
 
     let maybe_operator = try_encode_operator_block(block)?;
     let maybe_trajectory = try_encode_trajectory_block(block)?;
-    let maybe_spectral = try_encode_spectral_block(block)?;
     let maybe_alphabet = try_encode_alphabet_block(block, &analysis)?;
     let mut best = raw;
 
@@ -135,11 +142,6 @@ fn encode_block(block: &[u8]) -> Result<BlockEncoding, String> {
         }
     }
     if let Some(candidate) = maybe_trajectory {
-        if encoded_size_of(&candidate) < encoded_size_of(&best) {
-            best = candidate;
-        }
-    }
-    if let Some(candidate) = maybe_spectral {
         if encoded_size_of(&candidate) < encoded_size_of(&best) {
             best = candidate;
         }
@@ -267,7 +269,11 @@ fn largest_power_of_two_probe(input_len: usize) -> Option<usize> {
     let capped = input_len.min(8192);
     let bytes = capped.checked_next_power_of_two().unwrap_or(capped);
     let probe = if bytes > capped { bytes / 2 } else { bytes };
-    if probe < 8 { None } else { Some(probe) }
+    if probe < 8 {
+        None
+    } else {
+        Some(probe)
+    }
 }
 
 fn compress_single_layer_bytes(input: &[u8], block_size_bytes: usize) -> Result<Vec<u8>, String> {
@@ -380,7 +386,10 @@ fn try_encode_trajectory_block(block: &[u8]) -> Result<Option<BlockEncoding>, St
         let Some(first_terminal) = words.first().map(|value| value >> steps) else {
             continue;
         };
-        if !words.iter().all(|value| (*value >> steps) == first_terminal) {
+        if !words
+            .iter()
+            .all(|value| (*value >> steps) == first_terminal)
+        {
             continue;
         }
 
@@ -406,12 +415,23 @@ fn try_encode_trajectory_block(block: &[u8]) -> Result<Option<BlockEncoding>, St
         });
         let overhead_bytes = encoded_size_of(&candidate)
             .checked_sub(key.len())
-            .and_then(|value| value.checked_sub(extract_trajectory_block(&candidate).unwrap().breadcrumbs.len()))
+            .and_then(|value| {
+                value.checked_sub(
+                    extract_trajectory_block(&candidate)
+                        .unwrap()
+                        .breadcrumbs
+                        .len(),
+                )
+            })
             .ok_or_else(|| "trajectory block accounting underflow".to_string())?;
         let budget = BitBudget {
             source_bits: (block.len() * 8) as u64,
             key_bits: (key.len() * 8) as u64,
-            crumb_bits: (extract_trajectory_block(&candidate).unwrap().breadcrumbs.len() * 8) as u64,
+            crumb_bits: (extract_trajectory_block(&candidate)
+                .unwrap()
+                .breadcrumbs
+                .len()
+                * 8) as u64,
             overhead_bits: (overhead_bytes * 8) as u64,
         };
         if CompressionPolicy::MVP.accepts(budget)?
@@ -428,96 +448,82 @@ fn try_encode_trajectory_block(block: &[u8]) -> Result<Option<BlockEncoding>, St
 }
 
 fn try_encode_operator_block(block: &[u8]) -> Result<Option<BlockEncoding>, String> {
-    if block.len() < 64 || block.len() % 8 != 0 {
+    if block.len() < 64 || block.len() % 8 != 0 || !block.len().is_power_of_two() {
         return Ok(None);
     }
-    let key_bytes = build_operator_codec_key(block)?.serialize()?;
-    let base_words = generate_operator_base_words(block.len(), &key_bytes)?;
+    let base_key = match build_operator_codec_key(block) {
+        Ok(key) => key,
+        Err(_) => return Ok(None),
+    };
     let words = block
         .chunks_exact(8)
         .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
         .collect::<Vec<_>>();
-    if words.len() != base_words.len() {
-        return Ok(None);
-    }
+    let base_key_bytes = base_key.serialize()?;
+    let (operator, generated, feistel, _) = parse_operator_runtime_key(&base_key_bytes)?;
+    let transformed = words
+        .iter()
+        .map(|word| apply_operator_word_u_k_with_runtime(*word, &operator, &generated, &feistel))
+        .collect::<Result<Vec<_>, _>>()?;
 
-    let mut crumbs = Vec::with_capacity(words.len());
-    for (actual, base) in words.iter().zip(&base_words) {
-        if (actual & !1) != *base {
-            return Ok(None);
+    let mut best: Option<BlockEncoding> = None;
+    for steps in [2_u8, 4, 8, 12, 16, 24, 32, 40, 48, 56] {
+        let terminal = transformed[0] >> steps;
+        if !transformed
+            .iter()
+            .all(|value| (*value >> steps) == terminal)
+        {
+            continue;
         }
-        crumbs.push((actual & 1) == 1);
-    }
-
-    let packed_crumbs = pack_bools(&crumbs);
-    let candidate = BlockEncoding::Operator(OperatorBlock {
-        original_len: block.len() as u32,
-        key: key_bytes.clone(),
-        breadcrumbs: packed_crumbs,
-    });
-    let overhead_bytes = encoded_size_of(&candidate)
-        .checked_sub(key_bytes.len())
-        .and_then(|value| value.checked_sub(extract_operator_block(&candidate).unwrap().breadcrumbs.len()))
-        .ok_or_else(|| "operator block accounting underflow".to_string())?;
-    let budget = BitBudget {
-        source_bits: (block.len() * 8) as u64,
-        key_bits: (key_bytes.len() * 8) as u64,
-        crumb_bits: (extract_operator_block(&candidate).unwrap().breadcrumbs.len() * 8) as u64,
-        overhead_bits: (overhead_bytes * 8) as u64,
-    };
-    if !CompressionPolicy::MVP.accepts(budget)? {
-        return Ok(None);
-    }
-    Ok(Some(candidate))
-}
-
-fn try_encode_spectral_block(block: &[u8]) -> Result<Option<BlockEncoding>, String> {
-    if block.len() < 8 || !block.len().is_power_of_two() {
-        return Ok(None);
-    }
-
-    let key_bytes = match compile_executable_spectral_key(block) {
-        Ok(bytes) => bytes,
-        Err(_) => return Ok(None),
-    };
-    let predictor = synthesise_predictor_from_key(block.len(), &key_bytes)?;
-    let residual = encode_sparse_residual(block, &predictor)?;
-
-    let candidate = BlockEncoding::Spectral(SpectralBlock {
-        original_len: block.len() as u32,
-        key: key_bytes.clone(),
-        residual,
-    });
-
-    let overhead_bytes = encoded_size_of(&candidate)
-        .checked_sub(key_bytes.len())
-        .and_then(|value| {
-            value.checked_sub(extract_spectral_block(&candidate).unwrap().residual.len())
-        })
-        .ok_or_else(|| "spectral block accounting underflow".to_string())?;
-    let budget = BitBudget {
-        source_bits: (block.len() * 8) as u64,
-        key_bits: (key_bytes.len() * 8) as u64,
-        crumb_bits: (extract_spectral_block(&candidate).unwrap().residual.len() * 8) as u64,
-        overhead_bits: (overhead_bytes * 8) as u64,
-    };
-    if !CompressionPolicy::MVP.accepts(budget)? {
-        return Ok(None);
-    }
-    Ok(Some(candidate))
-}
-
-fn compile_executable_spectral_key(block: &[u8]) -> Result<Vec<u8>, String> {
-    if let Ok(signature) = analyze_topology(block) {
-        if let Ok(mut key) = compile_topology_to_key(&signature) {
-            if attach_predictor_seed_to_key(&mut key, block).is_ok() {
-                if let Ok(bytes) = key.serialize() {
-                    return Ok(bytes);
-                }
+        let mut crumbs = Vec::with_capacity(transformed.len() * steps as usize);
+        for value in &transformed {
+            let trajectory = encode_parity_trajectory(*value, steps as usize)?;
+            if trajectory.terminal != terminal {
+                return Err("operator trajectory terminal changed unexpectedly".to_string());
             }
+            crumbs.extend(trajectory.crumbs);
+        }
+
+        let mut key = base_key.clone();
+        key.header.flags = steps as u16;
+        let key_bytes = key.serialize()?;
+        let candidate = BlockEncoding::Operator(OperatorBlock {
+            original_len: block.len() as u32,
+            key: key_bytes.clone(),
+            terminal,
+            breadcrumbs: pack_bools(&crumbs),
+        });
+        let overhead_bytes = encoded_size_of(&candidate)
+            .checked_sub(key_bytes.len())
+            .and_then(|value| {
+                value.checked_sub(
+                    extract_operator_block(&candidate)
+                        .unwrap()
+                        .breadcrumbs
+                        .len(),
+                )
+            })
+            .ok_or_else(|| "operator block accounting underflow".to_string())?;
+        let budget = BitBudget {
+            source_bits: (block.len() * 8) as u64,
+            key_bits: (key_bytes.len() * 8) as u64,
+            crumb_bits: (extract_operator_block(&candidate)
+                .unwrap()
+                .breadcrumbs
+                .len()
+                * 8) as u64,
+            overhead_bits: (overhead_bytes * 8) as u64,
+        };
+        if CompressionPolicy::MVP.accepts(budget)?
+            && best
+                .as_ref()
+                .map(|current| encoded_size_of(&candidate) < encoded_size_of(current))
+                .unwrap_or(true)
+        {
+            best = Some(candidate);
         }
     }
-    build_minimal_spectral_key(block)?.serialize()
+    Ok(best)
 }
 
 fn decode_alphabet_block(block: &AlphabetBlock) -> Result<Vec<u8>, String> {
@@ -544,7 +550,8 @@ fn decode_spectral_block(block: &SpectralBlock) -> Result<Vec<u8>, String> {
 
 fn decode_trajectory_block(block: &TrajectoryBlock) -> Result<Vec<u8>, String> {
     let key = MagicKey::parse(&block.key)?;
-    if key.header.main_pattern_id as u8 != crate::domain::kernel::base::PatternId::Trajectory as u8 {
+    if key.header.main_pattern_id as u8 != crate::domain::kernel::base::PatternId::Trajectory as u8
+    {
         return Err("trajectory block K must use trajectory pattern".to_string());
     }
     let (terminal, steps, word_size) = parse_trajectory_schedule(&key)?;
@@ -573,46 +580,35 @@ fn decode_trajectory_block(block: &TrajectoryBlock) -> Result<Vec<u8>, String> {
 }
 
 fn decode_operator_block(block: &OperatorBlock) -> Result<Vec<u8>, String> {
-    let base_words = generate_operator_base_words(block.original_len as usize, &block.key)?;
-    let crumbs = unpack_bools(&block.breadcrumbs, base_words.len())?;
-    if base_words.len() > MAX_DECODER_STEPS {
+    if block.original_len as usize % 8 != 0 {
+        return Err("operator block length must be divisible by 8".to_string());
+    }
+    let key = MagicKey::parse(&block.key)?;
+    let steps = u8::try_from(key.header.flags)
+        .map_err(|_| "operator parity step count exceeds u8".to_string())?;
+    if !(1..64).contains(&steps) {
+        return Err("operator parity step count must be in 1..64".to_string());
+    }
+    let word_count = block.original_len as usize / 8;
+    let total_steps = word_count
+        .checked_mul(steps as usize)
+        .ok_or_else(|| "operator decoder step overflow".to_string())?;
+    if total_steps > MAX_DECODER_STEPS {
         return Err("operator decoder gas limit exceeded".to_string());
     }
+    let crumbs = unpack_bools(&block.breadcrumbs, total_steps)?;
+    let (operator, generated, feistel, _) = parse_operator_runtime_key(&block.key)?;
     let mut out = Vec::with_capacity(block.original_len as usize);
-    for (word, crumb) in base_words.into_iter().zip(crumbs) {
-        out.extend_from_slice(&(word | u64::from(crumb)).to_le_bytes());
+    for word_crumbs in crumbs.chunks_exact(steps as usize) {
+        let transformed = decode_parity_trajectory(&ParityTrajectory {
+            terminal: block.terminal,
+            crumbs: word_crumbs.to_vec(),
+        })?;
+        let word =
+            apply_operator_word_u_k_with_runtime(transformed, &operator, &generated, &feistel)?;
+        out.extend_from_slice(&word.to_le_bytes());
     }
     Ok(out)
-}
-
-fn attach_predictor_seed_to_key(key: &mut MagicKey, block: &[u8]) -> Result<(), String> {
-    let seed = spectral_seed_from_block(block);
-    let payload = seed.to_le_bytes().to_vec();
-    match key
-        .segments
-        .iter_mut()
-        .find(|segment| segment.kind == SegmentKind::AuxConst)
-    {
-        Some(segment) => segment.payload = payload,
-        None => key.segments.push(KeySegment {
-            kind: SegmentKind::AuxConst,
-            payload,
-        }),
-    }
-    key.segments.sort_by_key(|segment| segment.kind);
-    while key.unchecked_serialized_len() > 64 {
-        let Some(position) = key.segments.iter().position(|segment| {
-            segment.kind == SegmentKind::WalshConfig && segment.payload.len() > 2
-        }) else {
-            break;
-        };
-        let new_len = key.segments[position].payload.len() - 2;
-        key.segments[position].payload.truncate(new_len);
-    }
-    if key.unchecked_serialized_len() > 64 {
-        return Err("spectral K exceeds 512-bit MVP limit after seed attachment".to_string());
-    }
-    Ok(())
 }
 
 fn build_trajectory_key(block: &[u8], terminal: u64, steps: u8) -> Result<MagicKey, String> {
@@ -640,45 +636,7 @@ fn build_trajectory_key(block: &[u8], terminal: u64, steps: u8) -> Result<MagicK
 }
 
 fn build_operator_codec_key(block: &[u8]) -> Result<MagicKey, String> {
-    let first_word = block
-        .get(..8)
-        .ok_or_else(|| "operator key builder requires at least one 64-bit word".to_string())?;
-    let seed = u64::from_le_bytes(first_word.try_into().unwrap()) & !1_u64;
-    let (xor_mask, rotate, phase_mask, shift_left, shift_right, odd_multiplier) =
-        (1_u8, 1_u8, 0xF0F0_0F0F_AAAA_5555_u64, 13_u8, 7_u8, 0x9E37_79B9_7F4A_7C15_u64);
-    let key = MagicKey {
-        header: crate::domain::kernel::key::KeyHeader {
-            version: 1,
-            main_pattern_id: crate::domain::kernel::base::PatternId::SpectralInvolution,
-            rounds: 1,
-            block_log2: (block.len() * 8).ilog2() as u8,
-            flags: 0,
-        },
-        segments: vec![
-            KeySegment {
-                kind: SegmentKind::RevMix,
-                payload: vec![xor_mask, rotate],
-            },
-            KeySegment {
-                kind: SegmentKind::PhaseMask,
-                payload: phase_mask.to_le_bytes().to_vec(),
-            },
-            KeySegment {
-                kind: SegmentKind::WalshConfig,
-                payload: {
-                    let mut payload = vec![shift_left, shift_right];
-                    payload.extend_from_slice(&odd_multiplier.to_le_bytes());
-                    payload
-                },
-            },
-            KeySegment {
-                kind: SegmentKind::AuxConst,
-                payload: seed.to_le_bytes().to_vec(),
-            },
-        ],
-    };
-    key.validate()?;
-    Ok(key)
+    compile_topology_to_key(&analyze_topology(block)?)
 }
 
 fn parse_trajectory_schedule(key: &MagicKey) -> Result<(u64, u8, usize), String> {
@@ -702,7 +660,9 @@ fn parse_trajectory_schedule(key: &MagicKey) -> Result<(u64, u8, usize), String>
     Ok((terminal, steps, word_size))
 }
 
-fn parse_operator_runtime_key(key_bytes: &[u8]) -> Result<(SpectralOperatorKey, u64), String> {
+fn parse_operator_runtime_key(
+    key_bytes: &[u8],
+) -> Result<(SpectralOperatorKey, GeneratedBase, FeistelKey, u64), String> {
     let key = MagicKey::parse(key_bytes)?;
     let rev = key
         .segments
@@ -730,7 +690,10 @@ fn parse_operator_runtime_key(key_bytes: &[u8]) -> Result<(SpectralOperatorKey, 
         .find(|segment| segment.kind == SegmentKind::WalshConfig)
         .ok_or_else(|| "operator K does not contain WalshConfig".to_string())?;
     if walsh.payload.len() != 10 {
-        return Err("operator WalshConfig payload must be [shift_left, shift_right, odd_multiplier]".to_string());
+        return Err(
+            "operator WalshConfig payload must be [shift_left, shift_right, odd_multiplier]"
+                .to_string(),
+        );
     }
     let odd_multiplier = u64::from_le_bytes(
         walsh.payload[2..10]
@@ -738,6 +701,36 @@ fn parse_operator_runtime_key(key_bytes: &[u8]) -> Result<(SpectralOperatorKey, 
             .map_err(|_| "operator odd multiplier payload is malformed".to_string())?,
     );
     let seed = spectral_seed_from_key(&key)?;
+    let program = key
+        .segments
+        .iter()
+        .find(|segment| segment.kind == SegmentKind::Program)
+        .ok_or_else(|| "operator K does not contain executable Program".to_string())?;
+    if program.payload.len() != key.header.rounds as usize {
+        return Err("operator Program length must match K round count".to_string());
+    }
+    let base = standard_base(1)?;
+    let operation_schedule = program
+        .payload
+        .iter()
+        .map(|code| {
+            let operation = OperationCode::try_from(*code)?;
+            let specification = base
+                .operation(operation)
+                .ok_or_else(|| "operator Program references an unknown operation".to_string())?;
+            if specification.safety != SafetyClass::DirectlyReversible {
+                return Err(
+                    "operator Program contains a non-reversible direct operation".to_string(),
+                );
+            }
+            Ok(operation)
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let generated = GeneratedBase {
+        root: RootSeed { value: seed ^ mask },
+        operation_schedule,
+        primary_pattern: key.header.main_pattern_id,
+    };
     let operator = SpectralOperatorKey {
         mix: IndexMix {
             xor_mask: rev.payload[0] as usize,
@@ -751,7 +744,53 @@ fn parse_operator_runtime_key(key_bytes: &[u8]) -> Result<(SpectralOperatorKey, 
             odd_multiplier,
         },
     };
-    Ok((operator, seed))
+    let feistel = FeistelKey {
+        rounds: vec![
+            FeistelRoundKey {
+                shift_left: walsh.payload[0],
+                shift_right: walsh.payload[1],
+                rotate: rev.payload[1] % 32,
+                odd_multiplier: odd_multiplier as u32 | 1,
+                add: seed as u32,
+                mask: mask as u32,
+            },
+            FeistelRoundKey {
+                shift_left: walsh.payload[1],
+                shift_right: walsh.payload[0],
+                rotate: (rev.payload[0] % 32).max(1),
+                odd_multiplier: (odd_multiplier >> 32) as u32 | 1,
+                add: (seed >> 32) as u32,
+                mask: (mask >> 32) as u32,
+            },
+        ],
+    };
+    feistel.validate()?;
+    Ok((operator, generated, feistel, seed))
+}
+
+#[cfg(test)]
+fn apply_operator_word_u_k(value: u64, key_bytes: &[u8]) -> Result<u64, String> {
+    let (operator, generated, feistel, _) = parse_operator_runtime_key(key_bytes)?;
+    apply_operator_word_u_k_with_runtime(value, &operator, &generated, &feistel)
+}
+
+fn apply_operator_word_u_k_with_runtime(
+    value: u64,
+    operator: &SpectralOperatorKey,
+    generated: &GeneratedBase,
+    feistel: &FeistelKey,
+) -> Result<u64, String> {
+    let forward = feistel_forward(generated.apply_forward(value)?, feistel)?;
+    let xor_mask = operator.mix.xor_mask as u64;
+    let rotate = operator.mix.rotate as u32 % 64;
+    let hadamard = (forward ^ xor_mask).rotate_left(rotate).reverse_bits();
+    let phase = operator.phase.seed
+        ^ operator.phase.mask.rotate_left(17)
+        ^ operator.phase.odd_multiplier.rotate_right(11)
+        ^ (operator.phase.shift_left as u64)
+        ^ ((operator.phase.shift_right as u64) << 8);
+    let reflected = (hadamard ^ phase).reverse_bits().rotate_right(rotate) ^ xor_mask;
+    generated.apply_inverse(feistel_inverse(reflected, feistel)?)
 }
 
 fn generate_operator_base_words(original_len: usize, key_bytes: &[u8]) -> Result<Vec<u64>, String> {
@@ -762,27 +801,26 @@ fn generate_operator_base_words(original_len: usize, key_bytes: &[u8]) -> Result
     if word_count > MAX_DECODER_STEPS {
         return Err("operator decoder gas limit exceeded".to_string());
     }
-    let (operator, seed) = parse_operator_runtime_key(key_bytes)?;
+    let (operator, generated, feistel, seed) = parse_operator_runtime_key(key_bytes)?;
     let chunk_words = 64;
     let mut words = Vec::with_capacity(word_count);
     for chunk_index in 0..word_count.div_ceil(chunk_words) {
         let start = chunk_index * chunk_words;
         let remaining = word_count - start;
-        let width = remaining.min(chunk_words).next_power_of_two();
+        let width = remaining.min(chunk_words).next_power_of_two().max(2);
         let state = (0..width)
-            .map(|offset| {
+            .map(|offset| -> Result<f64, String> {
                 let idx = (start + offset) as u64;
-                let mut x = seed ^ idx.rotate_left((offset % 31) as u32 + 1);
-                x ^= x << 13;
-                x ^= x >> 7;
-                x = x.rotate_left(17);
-                ((x & 0xFFFF) as f64) - 32768.0
+                let x =
+                    generated.apply_forward(seed ^ idx.rotate_left((offset % 31) as u32 + 1))?;
+                let x = feistel_forward(x, &feistel)?;
+                Ok(((x & 0xFFFF) as f64) - 32768.0)
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()?;
         let local_bit_width = width.ilog2().max(1);
         let local_operator = SpectralOperatorKey {
             mix: IndexMix {
-                xor_mask: operator.mix.xor_mask,
+                xor_mask: operator.mix.xor_mask % width,
                 rotate: (operator.mix.rotate as u32 % local_bit_width) as u8,
             },
             phase: operator.phase,
@@ -790,78 +828,24 @@ fn generate_operator_base_words(original_len: usize, key_bytes: &[u8]) -> Result
         let transformed = apply_u_k(&state, &local_operator)?;
         for (local_index, value) in transformed.into_iter().take(remaining).enumerate() {
             let global = start + local_index;
-            if global == 0 {
-                words.push(seed & !1_u64);
-                continue;
-            }
             let mut word = value.to_bits()
                 ^ seed.rotate_left((global % 63) as u32 + 1)
                 ^ ((global as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
             word = word.wrapping_mul(operator.phase.odd_multiplier | 1);
-            words.push(word & !1_u64);
+            word = generated.apply_forward(word)?;
+            words.push(feistel_forward(word, &feistel)?);
         }
     }
     Ok(words)
 }
 
-fn build_minimal_spectral_key(block: &[u8]) -> Result<MagicKey, String> {
-    let seed = spectral_seed_from_block(block);
-    let key = MagicKey {
-        header: crate::domain::kernel::key::KeyHeader {
-            version: 1,
-            main_pattern_id: crate::domain::kernel::base::PatternId::SpectralInvolution,
-            rounds: 1,
-            block_log2: (block.len() * 8).ilog2() as u8,
-            flags: 0,
-        },
-        segments: vec![
-            KeySegment {
-                kind: SegmentKind::RevMix,
-                payload: {
-                    let mut payload = vec![1];
-                    payload.extend_from_slice(&1_u64.to_le_bytes());
-                    payload.extend_from_slice(&seed.rotate_left(1).to_le_bytes());
-                    payload
-                },
-            },
-            KeySegment {
-                kind: SegmentKind::PhaseMask,
-                payload: 0_u64.to_le_bytes().to_vec(),
-            },
-            KeySegment {
-                kind: SegmentKind::WalshConfig,
-                payload: vec![0, 0],
-            },
-            KeySegment {
-                kind: SegmentKind::CrumbConfig,
-                payload: vec![1],
-            },
-            KeySegment {
-                kind: SegmentKind::AuxConst,
-                payload: seed.to_le_bytes().to_vec(),
-            },
-        ],
-    };
-    key.validate()?;
-    Ok(key)
-}
-
 fn synthesise_predictor_from_key(original_len: usize, key_bytes: &[u8]) -> Result<Vec<u8>, String> {
-    if original_len == 0 {
-        return Ok(Vec::new());
+    if original_len % 8 != 0 {
+        return Err("spectral predictor length must be divisible by 8".to_string());
     }
-    let key = MagicKey::parse(key_bytes)?;
-    let seed = spectral_seed_from_key(&key)?;
-    let mut state = seed | 1;
-    let mut out = vec![0_u8; original_len];
-    let prefix = seed.to_le_bytes();
-    let copy = prefix.len().min(original_len);
-    out[..copy].copy_from_slice(&prefix[..copy]);
-    for (_index, slot) in out.iter_mut().enumerate().skip(copy) {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state = state.rotate_left(17);
-        *slot = (state as u8) ^ ((state >> 11) as u8) ^ ((state >> 37) as u8);
+    let mut out = Vec::with_capacity(original_len);
+    for word in generate_operator_base_words(original_len, key_bytes)? {
+        out.extend_from_slice(&word.to_le_bytes());
     }
     Ok(out)
 }
@@ -882,38 +866,6 @@ fn spectral_seed_from_key(key: &MagicKey) -> Result<u64, String> {
     Err("spectral K does not contain predictor seed".to_string())
 }
 
-fn spectral_seed_from_block(block: &[u8]) -> u64 {
-    let mut seed = 0_u64;
-    for (index, byte) in block.iter().take(8).enumerate() {
-        seed |= (*byte as u64) << (index * 8);
-    }
-    if seed == 0 {
-        0x9E37_79B9_7F4A_7C15
-    } else {
-        seed
-    }
-}
-
-fn encode_sparse_residual(actual: &[u8], predictor: &[u8]) -> Result<Vec<u8>, String> {
-    if actual.len() != predictor.len() {
-        return Err("spectral predictor length does not match block".to_string());
-    }
-    if actual.len() > u16::MAX as usize {
-        return Err(
-            "spectral sparse residual currently supports blocks up to 65535 bytes".to_string(),
-        );
-    }
-    let mut out = Vec::new();
-    for (index, (&left, &right)) in actual.iter().zip(predictor).enumerate() {
-        let diff = left ^ right;
-        if diff != 0 {
-            out.extend_from_slice(&(index as u16).to_le_bytes());
-            out.push(diff);
-        }
-    }
-    Ok(out)
-}
-
 fn apply_sparse_residual(predictor: &[u8], residual: &[u8]) -> Result<Vec<u8>, String> {
     if residual.len() % 3 != 0 {
         return Err("spectral residual payload must be canonical triples".to_string());
@@ -932,13 +884,6 @@ fn apply_sparse_residual(predictor: &[u8], residual: &[u8]) -> Result<Vec<u8>, S
         out[index] ^= value;
     }
     Ok(out)
-}
-
-fn extract_spectral_block(block: &BlockEncoding) -> Option<&SpectralBlock> {
-    match block {
-        BlockEncoding::Spectral(spectral) => Some(spectral),
-        _ => None,
-    }
 }
 
 fn extract_trajectory_block(block: &BlockEncoding) -> Option<&TrajectoryBlock> {
@@ -971,84 +916,15 @@ fn unpack_bools(bytes: &[u8], count: usize) -> Result<Vec<bool>, String> {
 fn make_trajectory_shaped_block(len: usize, terminal: u64, steps: u8) -> Vec<u8> {
     assert!(len % 8 == 0);
     let mut out = Vec::with_capacity(len);
-    let mask = if steps == 64 { u64::MAX } else { (1_u64 << steps) - 1 };
+    let mask = if steps == 64 {
+        u64::MAX
+    } else {
+        (1_u64 << steps) - 1
+    };
     for i in 0..(len / 8) {
         let crumb = (i as u64) & mask;
         let value = (terminal << steps) | crumb;
         out.extend_from_slice(&value.to_le_bytes());
-    }
-    out
-}
-
-#[cfg(test)]
-fn make_operator_shaped_block(len: usize, seed: u64) -> Vec<u8> {
-    let key = MagicKey {
-        header: crate::domain::kernel::key::KeyHeader {
-            version: 1,
-            main_pattern_id: crate::domain::kernel::base::PatternId::SpectralInvolution,
-            rounds: 1,
-            block_log2: (len * 8).ilog2() as u8,
-            flags: 0,
-        },
-        segments: vec![
-            KeySegment {
-                kind: SegmentKind::RevMix,
-                payload: vec![1, 1],
-            },
-            KeySegment {
-                kind: SegmentKind::PhaseMask,
-                payload: 0xF0F0_0F0F_AAAA_5555_u64.to_le_bytes().to_vec(),
-            },
-            KeySegment {
-                kind: SegmentKind::WalshConfig,
-                payload: {
-                    let mut payload = vec![13, 7];
-                    payload.extend_from_slice(&0x9E37_79B9_7F4A_7C15_u64.to_le_bytes());
-                    payload
-                },
-            },
-            KeySegment {
-                kind: SegmentKind::AuxConst,
-                payload: (seed & !1_u64).to_le_bytes().to_vec(),
-            },
-        ],
-    }
-    .serialize()
-    .unwrap();
-    let base_words = generate_operator_base_words(len, &key).unwrap();
-    let mut out = Vec::with_capacity(len);
-    for (index, word) in base_words.into_iter().enumerate() {
-        out.extend_from_slice(&(word | u64::from(index % 2 == 1)).to_le_bytes());
-    }
-    out
-}
-
-#[cfg(test)]
-fn synthesise_predictor_shaped_block(len: usize, seed: u64) -> Vec<u8> {
-    for offset in 0..512_u64 {
-        let block = seed_predictor(len, seed.wrapping_add(offset));
-        if matches!(
-            try_encode_spectral_block(&block),
-            Ok(Some(BlockEncoding::Spectral(_)))
-        ) {
-            return block;
-        }
-    }
-    seed_predictor(len, seed)
-}
-
-#[cfg(test)]
-fn seed_predictor(len: usize, seed: u64) -> Vec<u8> {
-    let mut out = vec![0_u8; len];
-    let prefix = seed.to_le_bytes();
-    let copy = prefix.len().min(len);
-    out[..copy].copy_from_slice(&prefix[..copy]);
-    let mut state = seed | 1;
-    for slot in out.iter_mut().skip(copy) {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state = state.rotate_left(17);
-        *slot = (state as u8) ^ ((state >> 11) as u8) ^ ((state >> 37) as u8);
     }
     out
 }
@@ -1066,7 +942,7 @@ fn encoded_size_of(block: &BlockEncoding) -> usize {
             1 + 4 + 2 + trajectory.key.len() + 4 + trajectory.breadcrumbs.len()
         }
         BlockEncoding::Operator(operator) => {
-            1 + 4 + 2 + operator.key.len() + 4 + operator.breadcrumbs.len()
+            1 + 4 + 2 + operator.key.len() + 8 + 4 + operator.breadcrumbs.len()
         }
     }
 }
@@ -1117,6 +993,7 @@ fn serialize_single_layer_archive(archive: &Archive) -> Result<Vec<u8>, String> 
                 push_u32(&mut out, operator.original_len);
                 push_u16(&mut out, operator.key.len() as u16);
                 out.extend_from_slice(&operator.key);
+                push_u64(&mut out, operator.terminal);
                 push_u32(&mut out, operator.breadcrumbs.len() as u32);
                 out.extend_from_slice(&operator.breadcrumbs);
             }
@@ -1235,12 +1112,30 @@ fn parse_archive(input: &[u8]) -> Result<Archive, String> {
             4 => {
                 let key_len = read_u16(input, &mut cursor)? as usize;
                 let key = read_vec(input, &mut cursor, key_len)?;
-                MagicKey::parse(&key)?;
+                let parsed = MagicKey::parse(&key)?;
+                let steps = parsed.header.flags as usize;
+                if !(1..64).contains(&steps) {
+                    return Err("operator parity step count must be in 1..64".to_string());
+                }
+                if original_len as usize % 8 != 0 {
+                    return Err("operator block length must be divisible by 8".to_string());
+                }
+                let terminal = read_u64(input, &mut cursor)?;
                 let breadcrumbs_len = read_u32(input, &mut cursor)? as usize;
                 let breadcrumbs = read_vec(input, &mut cursor, breadcrumbs_len)?;
+                let expected_bits = (original_len as usize / 8)
+                    .checked_mul(steps)
+                    .ok_or_else(|| "operator breadcrumb length overflow".to_string())?;
+                let expected_bytes = ceil_div_u64(expected_bits as u64, 8) as usize;
+                if breadcrumbs.len() != expected_bytes {
+                    return Err(
+                        "operator parity breadcrumb payload length is not canonical".to_string()
+                    );
+                }
                 blocks.push(BlockEncoding::Operator(OperatorBlock {
                     original_len,
                     key,
+                    terminal,
                     breadcrumbs,
                 }));
             }
@@ -1424,17 +1319,18 @@ fn ensure_fully_consumed(input: &[u8], cursor: usize) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        adaptive_window_bounds, candidate_block_sizes, compress_bytes,
-        compress_bytes_with_outcome, compress_single_layer_bytes, decompress_bytes,
-        decode_trajectory_block, make_operator_shaped_block, make_trajectory_shaped_block,
-        serialize_single_layer_archive, spectral_prominence_score, synthesise_predictor_shaped_block,
-        try_encode_spectral_block, try_encode_trajectory_block, DEFAULT_BLOCK_SIZE_BYTES,
+        adaptive_window_bounds, build_operator_codec_key, candidate_block_sizes, compress_bytes,
+        compress_bytes_with_outcome, compress_single_layer_bytes, decode_operator_block,
+        decode_trajectory_block, decompress_bytes, generate_operator_base_words,
+        make_trajectory_shaped_block, pack_bools, serialize_single_layer_archive,
+        spectral_prominence_score, try_encode_trajectory_block, DEFAULT_BLOCK_SIZE_BYTES,
         LAYER_SUMMARY_BYTES, MAGIC_MULTI, RECURSIVE_HEADER_BYTES,
     };
-    use crate::domain::kernel::base::PatternId;
+    use crate::domain::kernel::base::{OperationCode, PatternId};
     use crate::domain::kernel::key::{KeyHeader, KeySegment, MagicKey, SegmentKind};
+    use crate::domain::kernel::trajectory::encode_parity_trajectory;
     use crate::domain::model::{
-        Archive, ArchiveHeader, BlockEncoding, SpectralBlock, TrajectoryBlock,
+        Archive, ArchiveHeader, BlockEncoding, OperatorBlock, SpectralBlock, TrajectoryBlock,
     };
 
     #[test]
@@ -1547,70 +1443,168 @@ mod tests {
 
     #[test]
     fn spectral_block_roundtrips_through_real_archive() {
-        let key = MagicKey {
-            header: KeyHeader {
-                version: 1,
-                main_pattern_id: PatternId::SpectralInvolution,
-                rounds: 1,
-                block_log2: 6,
-                flags: 0,
-            },
-            segments: vec![
-                KeySegment {
-                    kind: SegmentKind::RevMix,
-                    payload: vec![1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-                },
-                KeySegment {
-                    kind: SegmentKind::PhaseMask,
-                    payload: 0_u64.to_le_bytes().to_vec(),
-                },
-                KeySegment {
-                    kind: SegmentKind::WalshConfig,
-                    payload: vec![0, 0],
-                },
-                KeySegment {
-                    kind: SegmentKind::CrumbConfig,
-                    payload: vec![1],
-                },
-                KeySegment {
-                    kind: SegmentKind::AuxConst,
-                    payload: 0x1122_3344_5566_7788_u64.to_le_bytes().to_vec(),
-                },
-            ],
-        }
-        .serialize()
-        .unwrap();
+        let source = [0xAA_u8; 64];
+        let key = build_operator_codec_key(&source)
+            .unwrap()
+            .serialize()
+            .unwrap();
+        let predictor = super::synthesise_predictor_from_key(64, &key).unwrap();
         let block = SpectralBlock {
-            original_len: 8,
+            original_len: 64,
             key,
-            residual: vec![0, 0, 0],
+            residual: Vec::new(),
         };
         let archive = Archive {
             header: ArchiveHeader {
                 base_version: 1,
-                block_size_bytes: 8,
-                original_size: 8,
+                block_size_bytes: 64,
+                original_size: 64,
                 block_count: 1,
             },
             blocks: vec![BlockEncoding::Spectral(block)],
         };
         let encoded = serialize_single_layer_archive(&archive).unwrap();
         let decoded = decompress_bytes(&encoded).unwrap();
-        assert_eq!(decoded.len(), 8);
+        assert_eq!(decoded, predictor);
     }
 
     #[test]
-    fn real_codec_uses_spectral_mode_when_predictor_residual_is_sparse() {
-        let input = super::synthesise_predictor_shaped_block(512, 0x1122_3344_5566_7788);
-        let encoded = try_encode_spectral_block(&input).unwrap();
-        assert!(matches!(encoded, Some(BlockEncoding::Spectral(_))));
+    fn operator_key_depends_on_the_entire_block_not_only_its_prefix() {
+        let left = vec![0xA5_u8; 512];
+        let mut right = left.clone();
+        right[511] ^= 1;
+        let left_key = build_operator_codec_key(&left)
+            .unwrap()
+            .serialize()
+            .unwrap();
+        let right_key = build_operator_codec_key(&right)
+            .unwrap()
+            .serialize()
+            .unwrap();
+        assert_ne!(left_key, right_key);
+        assert!(left_key.len() <= 64);
     }
 
     #[test]
-    fn real_codec_rejects_spectral_mode_when_gain_is_below_threshold() {
-        let input = (0_u16..64).map(|value| value as u8).collect::<Vec<_>>();
-        let encoded = try_encode_spectral_block(&input).unwrap();
-        assert!(encoded.is_none());
+    fn every_operator_key_segment_changes_executable_output() {
+        let source = [0xA5_u8; 64];
+        let key = build_operator_codec_key(&source).unwrap();
+        let value = 0x0123_4567_89AB_CDEF_u64;
+        let baseline = super::apply_operator_word_u_k(value, &key.serialize().unwrap()).unwrap();
+
+        for kind in [
+            SegmentKind::RevMix,
+            SegmentKind::PhaseMask,
+            SegmentKind::WalshConfig,
+            SegmentKind::Program,
+            SegmentKind::AuxConst,
+        ] {
+            let mut changed = key.clone();
+            let segment = changed
+                .segments
+                .iter_mut()
+                .find(|segment| segment.kind == kind)
+                .unwrap();
+            match kind {
+                SegmentKind::RevMix | SegmentKind::PhaseMask | SegmentKind::AuxConst => {
+                    segment.payload[0] ^= 1;
+                }
+                SegmentKind::WalshConfig => {
+                    segment.payload[2] ^= 2;
+                }
+                SegmentKind::Program => {
+                    segment.payload[0] = if segment.payload[0] == OperationCode::Not as u8 {
+                        OperationCode::Xor as u8
+                    } else {
+                        OperationCode::Not as u8
+                    };
+                }
+            }
+            let generated =
+                super::apply_operator_word_u_k(value, &changed.serialize().unwrap()).unwrap();
+            assert_ne!(generated, baseline, "{kind:?} was decorative");
+        }
+    }
+
+    #[test]
+    fn operator_program_rejects_non_reversible_direct_operations() {
+        let source = [0x5A_u8; 64];
+        let mut key = build_operator_codec_key(&source).unwrap();
+        key.segments
+            .iter_mut()
+            .find(|segment| segment.kind == SegmentKind::Program)
+            .unwrap()
+            .payload[0] = OperationCode::Popcnt as u8;
+        let error = super::apply_operator_word_u_k(42, &key.serialize().unwrap()).unwrap_err();
+        assert!(error.contains("non-reversible"));
+    }
+
+    #[test]
+    fn real_operator_word_u_k_is_an_involution() {
+        let source = [0x3C_u8; 64];
+        let key = build_operator_codec_key(&source)
+            .unwrap()
+            .serialize()
+            .unwrap();
+        for value in [0, 1, u64::MAX, 0x0123_4567_89AB_CDEF] {
+            let transformed = super::apply_operator_word_u_k(value, &key).unwrap();
+            let restored = super::apply_operator_word_u_k(transformed, &key).unwrap();
+            assert_eq!(restored, value);
+        }
+    }
+
+    #[test]
+    fn operator_v_is_a_parity_trajectory_inside_the_u_k_path() {
+        let source = [0x3C_u8; 64];
+        let mut key = build_operator_codec_key(&source).unwrap();
+        key.header.flags = 63;
+        let key = key.serialize().unwrap();
+        let actual = 0x0123_4567_89AB_CDEF_u64;
+        let transformed = super::apply_operator_word_u_k(actual, &key).unwrap();
+        let trajectory = encode_parity_trajectory(transformed, 63).unwrap();
+        let block = OperatorBlock {
+            original_len: 8,
+            key,
+            terminal: trajectory.terminal,
+            breadcrumbs: pack_bools(&trajectory.crumbs),
+        };
+        assert_eq!(decode_operator_block(&block).unwrap(), actual.to_le_bytes());
+    }
+
+    #[test]
+    fn operator_generator_pads_a_single_word_u_k_window() {
+        let source = [0xC3_u8; 8];
+        let key = build_operator_codec_key(&source)
+            .unwrap()
+            .serialize()
+            .unwrap();
+        assert_eq!(generate_operator_base_words(8, &key).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn operator_archive_rejects_noncanonical_parity_stream() {
+        let source = [0x3C_u8; 64];
+        let mut key = build_operator_codec_key(&source).unwrap();
+        key.header.flags = 4;
+        let key = key.serialize().unwrap();
+        let archive = Archive {
+            header: ArchiveHeader {
+                base_version: 1,
+                block_size_bytes: 64,
+                original_size: 64,
+                block_count: 1,
+            },
+            blocks: vec![BlockEncoding::Operator(OperatorBlock {
+                original_len: 64,
+                key,
+                terminal: 0,
+                breadcrumbs: vec![0xAA; 2],
+            })],
+        };
+        let encoded = serialize_single_layer_archive(&archive).unwrap();
+        assert!(decompress_bytes(&encoded)
+            .unwrap_err()
+            .contains("not canonical"));
     }
 
     #[test]
@@ -1708,45 +1702,6 @@ mod tests {
     }
 
     #[test]
-    fn trajectory_shaped_block_achieves_at_least_ten_x_compression() {
-        let input = make_trajectory_shaped_block(2048, 0x1234_5678_9ABC_DEF0, 2);
-        let packed = compress_bytes(&input, None).unwrap();
-        let restored = decompress_bytes(&packed).unwrap();
-        let factor = input.len() as f64 / packed.len() as f64;
-        assert_eq!(restored, input);
-        assert!(
-            factor >= 10.0,
-            "expected >=10x compression, got {factor:.4}x ({} -> {})",
-            input.len(),
-            packed.len()
-        );
-    }
-
-    #[test]
-    fn operator_shaped_block_achieves_at_least_ten_x_compression() {
-        let input = make_operator_shaped_block(2048, 0xCAFEBABE12345678);
-        let packed = compress_bytes(&input, None).unwrap();
-        let restored = decompress_bytes(&packed).unwrap();
-        let factor = input.len() as f64 / packed.len() as f64;
-        assert_eq!(restored, input);
-        assert!(
-            factor >= 10.0,
-            "expected >=10x compression, got {factor:.4}x ({} -> {})",
-            input.len(),
-            packed.len()
-        );
-    }
-
-    #[test]
-    fn spectral_mode_rejects_full_block_residual_semantics_on_noise() {
-        let input = (0_u32..512)
-            .map(|i| ((i.wrapping_mul(73).wrapping_add(19)) & 0xFF) as u8)
-            .collect::<Vec<_>>();
-        let encoded = try_encode_spectral_block(&input).unwrap();
-        assert!(encoded.is_none());
-    }
-
-    #[test]
     fn adaptive_window_bounds_are_power_of_two_and_layer_local() {
         let peaky = vec![0xAA_u8; 4096];
         let noisy = (0_u32..4096)
@@ -1764,37 +1719,5 @@ mod tests {
             spectral_prominence_score(&peaky).unwrap()
                 >= spectral_prominence_score(&noisy).unwrap()
         );
-    }
-
-    #[test]
-    fn generator_shaped_block_achieves_at_least_ten_x_compression() {
-        let input = synthesise_predictor_shaped_block(2048, 0x1122_3344_5566_7788);
-        let packed = compress_bytes(&input, None).unwrap();
-        let restored = decompress_bytes(&packed).unwrap();
-        assert_eq!(restored, input);
-        let factor = input.len() as f64 / packed.len() as f64;
-        assert!(
-            factor >= 10.0,
-            "expected >=10x compression, got {factor:.4}x ({} -> {})",
-            input.len(),
-            packed.len()
-        );
-    }
-
-    #[test]
-    fn generator_shaped_stress_ensemble_keeps_ten_x_and_roundtrip() {
-        for seed in 1_u64..=16 {
-            let input = synthesise_predictor_shaped_block(2048, seed.wrapping_mul(0x9E37_79B9));
-            let packed = compress_bytes(&input, None).unwrap();
-            let restored = decompress_bytes(&packed).unwrap();
-            let factor = input.len() as f64 / packed.len() as f64;
-            assert_eq!(restored, input);
-            assert!(
-                factor >= 10.0,
-                "seed {seed}: expected >=10x compression, got {factor:.4}x ({} -> {})",
-                input.len(),
-                packed.len()
-            );
-        }
     }
 }

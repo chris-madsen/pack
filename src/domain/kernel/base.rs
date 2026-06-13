@@ -22,6 +22,33 @@ pub enum OperationCode {
     CountTrailingZeros = 0x11,
 }
 
+impl TryFrom<u8> for OperationCode {
+    type Error = String;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0x01 => Ok(Self::Xor),
+            0x02 => Ok(Self::RotateLeft),
+            0x03 => Ok(Self::RotateRight),
+            0x04 => Ok(Self::XorShiftLeft),
+            0x05 => Ok(Self::XorShiftRight),
+            0x06 => Ok(Self::Add),
+            0x07 => Ok(Self::Subtract),
+            0x08 => Ok(Self::MultiplyOdd),
+            0x09 => Ok(Self::BitPermutation),
+            0x0A => Ok(Self::WalshHadamard),
+            0x0B => Ok(Self::PhaseReflect),
+            0x0C => Ok(Self::Or),
+            0x0D => Ok(Self::And),
+            0x0E => Ok(Self::Not),
+            0x0F => Ok(Self::Popcnt),
+            0x10 => Ok(Self::CountLeadingZeros),
+            0x11 => Ok(Self::CountTrailingZeros),
+            _ => Err(format!("unknown operation code: {value}")),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SafetyClass {
     DirectlyReversible,
@@ -60,6 +87,29 @@ pub struct GeneratedBase {
     pub root: RootSeed,
     pub operation_schedule: Vec<OperationCode>,
     pub primary_pattern: PatternId,
+}
+
+impl GeneratedBase {
+    pub fn apply_forward(&self, value: u64) -> Result<u64, String> {
+        self.operation_schedule
+            .iter()
+            .copied()
+            .enumerate()
+            .try_fold(value, |state, (round, operation)| {
+                apply_operation(state, operation, round_constant(self.root, round))
+            })
+    }
+
+    pub fn apply_inverse(&self, value: u64) -> Result<u64, String> {
+        self.operation_schedule
+            .iter()
+            .copied()
+            .enumerate()
+            .rev()
+            .try_fold(value, |state, (round, operation)| {
+                invert_operation(state, operation, round_constant(self.root, round))
+            })
+    }
 }
 
 impl StandardBase {
@@ -191,6 +241,95 @@ pub fn generate_base_from_root(
     })
 }
 
+fn round_constant(root: RootSeed, round: usize) -> u64 {
+    let mixed = root
+        .value
+        .wrapping_add((round as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    avalanche(mixed)
+}
+
+fn avalanche(mut value: u64) -> u64 {
+    value ^= value >> 30;
+    value = value.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    value ^= value >> 27;
+    value = value.wrapping_mul(0x94D0_49BB_1331_11EB);
+    value ^ (value >> 31)
+}
+
+fn apply_operation(value: u64, operation: OperationCode, parameter: u64) -> Result<u64, String> {
+    let shift = ((parameter % 63) + 1) as u32;
+    let rotate = (parameter % 64) as u32;
+    Ok(match operation {
+        OperationCode::Xor => value ^ parameter,
+        OperationCode::RotateLeft => value.rotate_left(rotate),
+        OperationCode::RotateRight => value.rotate_right(rotate),
+        OperationCode::XorShiftLeft => value ^ value.wrapping_shl(shift),
+        OperationCode::XorShiftRight => value ^ value.wrapping_shr(shift),
+        OperationCode::Add => value.wrapping_add(parameter),
+        OperationCode::Subtract => value.wrapping_sub(parameter),
+        OperationCode::MultiplyOdd => value.wrapping_mul(parameter | 1),
+        OperationCode::BitPermutation | OperationCode::WalshHadamard => value.reverse_bits(),
+        OperationCode::PhaseReflect => value ^ parameter.rotate_left(17),
+        OperationCode::Not => !value,
+        other => {
+            return Err(format!(
+                "operation {other:?} is not reversible at word level"
+            ))
+        }
+    })
+}
+
+fn invert_operation(value: u64, operation: OperationCode, parameter: u64) -> Result<u64, String> {
+    let shift = ((parameter % 63) + 1) as u32;
+    let rotate = (parameter % 64) as u32;
+    Ok(match operation {
+        OperationCode::Xor => value ^ parameter,
+        OperationCode::RotateLeft => value.rotate_right(rotate),
+        OperationCode::RotateRight => value.rotate_left(rotate),
+        OperationCode::XorShiftLeft => invert_xorshift_left(value, shift),
+        OperationCode::XorShiftRight => invert_xorshift_right(value, shift),
+        OperationCode::Add => value.wrapping_sub(parameter),
+        OperationCode::Subtract => value.wrapping_add(parameter),
+        OperationCode::MultiplyOdd => value.wrapping_mul(modular_inverse_odd(parameter | 1)),
+        OperationCode::BitPermutation | OperationCode::WalshHadamard => value.reverse_bits(),
+        OperationCode::PhaseReflect => value ^ parameter.rotate_left(17),
+        OperationCode::Not => !value,
+        other => {
+            return Err(format!(
+                "operation {other:?} is not reversible at word level"
+            ))
+        }
+    })
+}
+
+fn invert_xorshift_left(value: u64, shift: u32) -> u64 {
+    let mut restored = value;
+    let mut offset = shift;
+    while offset < 64 {
+        restored ^= restored.wrapping_shl(offset);
+        offset = offset.saturating_mul(2);
+    }
+    restored
+}
+
+fn invert_xorshift_right(value: u64, shift: u32) -> u64 {
+    let mut restored = value;
+    let mut offset = shift;
+    while offset < 64 {
+        restored ^= restored.wrapping_shr(offset);
+        offset = offset.saturating_mul(2);
+    }
+    restored
+}
+
+fn modular_inverse_odd(value: u64) -> u64 {
+    let mut inverse = value;
+    for _ in 0..6 {
+        inverse = inverse.wrapping_mul(2_u64.wrapping_sub(value.wrapping_mul(inverse)));
+    }
+    inverse
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -247,5 +386,34 @@ mod tests {
         let left = generate_base_from_root(&base, RootSeed { value: 1 }).unwrap();
         let right = generate_base_from_root(&base, RootSeed { value: 2 }).unwrap();
         assert_ne!(left.operation_schedule, right.operation_schedule);
+    }
+
+    #[test]
+    fn generated_base_schedule_is_executable_and_reversible() {
+        let base = standard_base(1).unwrap();
+        let generated = generate_base_from_root(
+            &base,
+            RootSeed {
+                value: 0xDEAD_BEEF_CAFE_BABE,
+            },
+        )
+        .unwrap();
+        for value in [0, 1, u64::MAX, 0x0123_4567_89AB_CDEF] {
+            let encoded = generated.apply_forward(value).unwrap();
+            assert_ne!(encoded, value);
+            assert_eq!(generated.apply_inverse(encoded).unwrap(), value);
+        }
+    }
+
+    #[test]
+    fn changing_generated_schedule_changes_execution() {
+        let base = standard_base(1).unwrap();
+        let left = generate_base_from_root(&base, RootSeed { value: 11 }).unwrap();
+        let right = generate_base_from_root(&base, RootSeed { value: 12 }).unwrap();
+        let value = 0x0123_4567_89AB_CDEF;
+        assert_ne!(
+            left.apply_forward(value).unwrap(),
+            right.apply_forward(value).unwrap()
+        );
     }
 }

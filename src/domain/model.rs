@@ -54,6 +54,7 @@ pub struct TrajectoryBlock {
 pub struct OperatorBlock {
     pub original_len: u32,
     pub key: Vec<u8>,
+    pub terminal: u64,
     pub breadcrumbs: Vec<u8>,
 }
 
