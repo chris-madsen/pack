@@ -1,257 +1,379 @@
-// FILE: src/domain/kernel/topology.rs
-//
-// Derives codec keys deterministically from a block's Walsh spectrum.
-// This is the true meta-generator: block statistics → key, no search required.
+use crate::domain::kernel::key::{
+    MagicKey, OperatorBlueprint, SpectralPeakCode, SpectralProgram, MAX_SPECTRAL_PEAKS,
+};
+use crate::domain::kernel::spectral::{normalized_fwht, strongest_walsh_peaks, SpectralPeak};
 
-use crate::domain::kernel::key::{MagicKey, OperatorBlueprint, SpectralPeakCode, SpectralProgram};
-use crate::domain::kernel::spectral::{normalized_fwht, strongest_walsh_peaks};
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShiftScore {
+    pub shift: usize,
+    pub matching_bits: usize,
+}
 
-// ── Public types ─────────────────────────────────────────────────────────────
-
-/// Cached result of the O(n log n) Walsh transform + derived statistics.
-/// Computed once per block and threaded through all encoders.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TopologySignature {
-    /// Length of the block in bits (= block.len() * 8).
-    /// Must be a non-zero power of two.
     pub bit_len: usize,
-    /// Top Walsh peaks sorted by |coefficient|, strongest first.
-    pub walsh_peaks: Vec<WalshPeak>,
-    /// Per-shift XOR-spread scores (32 entries, shift k → index k-1).
-    pub shift_scores: Vec<u8>,
-    /// 48-bit XOR-fold fingerprint for trajectory key seeding.
+    pub walsh_peaks: Vec<SpectralPeak>,
+    pub shift_scores: Vec<ShiftScore>,
+    pub derivative: Vec<u8>,
+    pub popcnt_profile: Vec<u8>,
     pub fingerprint: u64,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct WalshPeak {
-    pub index:       usize,
-    pub coefficient: f64,
+pub fn bytes_to_bits(bytes: &[u8]) -> Vec<u8> {
+    bytes
+        .iter()
+        .flat_map(|byte| (0..8).map(move |bit| (byte >> bit) & 1))
+        .collect()
 }
 
-// ── Core analysis ─────────────────────────────────────────────────────────────
-
-/// Run the normalised FWHT on `block` (interpreted as ±1 signal) and return
-/// the derived `TopologySignature`.  `block.len() * 8` must be a non-zero
-/// power of two.
-pub fn analyze_topology(block: &[u8]) -> Result<TopologySignature, String> {
-    let bit_len = block.len() * 8;
-    if bit_len == 0 || !bit_len.is_power_of_two() {
-        return Err(format!(
-            "analyze_topology: bit_len {bit_len} must be a non-zero power of two"
-        ));
+pub fn block_fingerprint(bytes: &[u8]) -> Result<u64, String> {
+    if bytes.is_empty() {
+        return Err("block fingerprint requires non-empty input".to_string());
     }
-
-    // Convert bytes to ±1 f64 signal
-    let mut signal: Vec<f64> = block
-        .iter()
-        .flat_map(|&b| (0..8u8).map(move |i| if (b >> i) & 1 == 1 { 1.0 } else { -1.0 }))
-        .collect();
-
-    normalized_fwht(&mut signal)?;
-
-    let raw_peaks = strongest_walsh_peaks(&signal, 8);
-    let walsh_peaks: Vec<WalshPeak> = raw_peaks
-        .iter()
-        .map(|p| WalshPeak { index: p.index, coefficient: p.coefficient })
-        .collect();
-
-    // Shift scores: for shift k+1, score = XOR-spread heuristic
-    let shift_scores: Vec<u8> = (1_u8..=32).map(|shift| {
-        let spread: u64 = block
-            .iter()
-            .zip(block.iter().cycle().skip(shift as usize))
-            .map(|(&a, &b)| u64::from((a ^ b).count_ones() as u8))
-            .sum();
-        (spread.min(255 * block.len() as u64) / block.len().max(1) as u64) as u8
-    }).collect();
-
-    // 48-bit XOR-fold fingerprint
-    let fingerprint = block
-        .chunks(6)
-        .fold(0_u64, |acc, chunk| {
-            let mut word = 0_u64;
-            for (i, &b) in chunk.iter().enumerate() {
-                word |= (b as u64) << (i * 8);
-            }
-            acc ^ word
-        })
-        & 0x0000_FFFF_FFFF_FFFF;
-
-    Ok(TopologySignature { bit_len, walsh_peaks, shift_scores, fingerprint })
+    let state =
+        bytes
+            .chunks(8)
+            .enumerate()
+            .fold(0x6A09_E667_F3BC_C909_u64, |state, (index, chunk)| {
+                let mut word_bytes = [0_u8; 8];
+                word_bytes[..chunk.len()].copy_from_slice(chunk);
+                let word = u64::from_le_bytes(word_bytes)
+                    ^ (index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                avalanche(state ^ avalanche(word))
+            });
+    Ok(avalanche(state ^ bytes.len() as u64))
 }
 
-// ── Key compilers ─────────────────────────────────────────────────────────────
-
-/// Derive an `OperatorBlueprint`-tagged `MagicKey` from a `TopologySignature`.
-pub fn compile_topology_to_key(sig: &TopologySignature) -> Result<MagicKey, String> {
-    if sig.walsh_peaks.is_empty() {
-        return Err("compile_topology_to_key: signature has no Walsh peaks".to_string());
+pub fn circular_bit_derivative(bits: &[u8], shift: usize) -> Result<Vec<u8>, String> {
+    validate_bits(bits)?;
+    if bits.is_empty() || shift == 0 || shift >= bits.len() {
+        return Err("derivative shift must be inside the bit vector".to_string());
     }
-
-    let p0 = &sig.walsh_peaks[0];
-    let p1 = sig.walsh_peaks.get(1).unwrap_or(p0);
-
-    let primary_shift = sig
-        .shift_scores
+    Ok(bits
         .iter()
-        .copied()
         .enumerate()
-        .max_by_key(|&(_, s)| s)
-        .map(|(i, _)| (i + 1).min(31).max(1) as u8)
-        .unwrap_or(1);
+        .map(|(index, bit)| bit ^ bits[(index + shift) % bits.len()])
+        .collect())
+}
 
-    let secondary_delta = ((p1.index.wrapping_sub(p0.index)) % 32) as u8;
-    let tertiary_delta  = ((p0.index.wrapping_add(p1.index)) % 32) as u8;
+pub fn shift_correlation(bits: &[u8], shift: usize) -> Result<ShiftScore, String> {
+    validate_bits(bits)?;
+    if bits.is_empty() || shift == 0 || shift >= bits.len() {
+        return Err("correlation shift must be inside the bit vector".to_string());
+    }
+    let matching_bits = bits
+        .iter()
+        .enumerate()
+        .filter(|(index, bit)| **bit == bits[(index + shift) % bits.len()])
+        .count();
+    Ok(ShiftScore {
+        shift,
+        matching_bits,
+    })
+}
 
-    let bp = OperatorBlueprint {
-        dominant_index:     (p0.index & 0x3F) as u16,
-        dominant_positive:  p0.coefficient > 0.0,
-        primary_shift,
-        shift_match:        (p1.index & 0x1FF) as u16,
-        derivative_density: ((sig.fingerprint >> 8)  & 0xFF) as u8,
-        popcnt_density:     ((sig.fingerprint >> 16) & 0xFF) as u8,
+pub fn popcnt_profile(bytes: &[u8], window_bytes: usize) -> Result<Vec<u8>, String> {
+    if window_bytes == 0 {
+        return Err("popcnt window must be non-zero".to_string());
+    }
+    bytes
+        .chunks(window_bytes)
+        .map(|chunk| {
+            let count = chunk.iter().map(|byte| byte.count_ones()).sum::<u32>();
+            u8::try_from(count).map_err(|_| "popcnt window exceeds u8 profile range".to_string())
+        })
+        .collect()
+}
+
+pub fn analyze_topology(bytes: &[u8]) -> Result<TopologySignature, String> {
+    let bits = bytes_to_bits(bytes);
+    if bits.is_empty() || !bits.len().is_power_of_two() {
+        return Err("topology analyzer requires a power-of-two bit block".to_string());
+    }
+
+    let mut signal = bits
+        .iter()
+        .map(|bit| if *bit == 0 { -1.0 } else { 1.0 })
+        .collect::<Vec<_>>();
+    normalized_fwht(&mut signal)?;
+    let walsh_peaks = strongest_walsh_peaks(&signal, 4);
+
+    let max_shift = 32.min(bits.len() - 1);
+    let mut shift_scores = (1..=max_shift)
+        .map(|shift| shift_correlation(&bits, shift))
+        .collect::<Result<Vec<_>, _>>()?;
+    shift_scores.sort_by(|left, right| {
+        right
+            .matching_bits
+            .cmp(&left.matching_bits)
+            .then_with(|| left.shift.cmp(&right.shift))
+    });
+    shift_scores.truncate(3);
+
+    let derivative = circular_bit_derivative(&bits, 1)?;
+    let popcnt_profile = popcnt_profile(bytes, 8)?;
+    let fingerprint = block_fingerprint(bytes)?;
+
+    Ok(TopologySignature {
+        bit_len: bits.len(),
+        walsh_peaks,
+        shift_scores,
+        derivative,
+        popcnt_profile,
+        fingerprint,
+    })
+}
+
+pub fn compile_topology_to_key(signature: &TopologySignature) -> Result<MagicKey, String> {
+    if signature.bit_len == 0 || !signature.bit_len.is_power_of_two() {
+        return Err("signature bit length must be a power of two".to_string());
+    }
+    if signature.walsh_peaks.is_empty() || signature.shift_scores.is_empty() {
+        return Err("signature lacks required topology features".to_string());
+    }
+
+    let dominant = &signature.walsh_peaks[0];
+    let second = signature.walsh_peaks.get(1).unwrap_or(dominant);
+    let third = signature.walsh_peaks.get(2).unwrap_or(dominant);
+    let shift = &signature.shift_scores[0];
+    let derivative_density = quantize_ratio(
+        signature.derivative.iter().filter(|bit| **bit == 1).count(),
+        signature.derivative.len(),
+        8,
+    );
+    let derivative_signature =
+        (derivative_density & !1) | u64::from(*signature.derivative.first().unwrap_or(&0));
+    let popcnt_sum = signature
+        .popcnt_profile
+        .iter()
+        .map(|count| *count as usize)
+        .sum::<usize>();
+    let popcnt_capacity = signature.popcnt_profile.len().saturating_mul(64);
+    let popcnt_density = quantize_ratio(popcnt_sum, popcnt_capacity.max(1), 8);
+    let popcnt_signature = (popcnt_density & !0x0F)
+        | u64::from(signature.popcnt_profile.first().copied().unwrap_or(0) & 0x0F);
+    let shift_match = quantize_ratio(shift.matching_bits, signature.bit_len, 9);
+    let secondary_delta = ((second.index ^ dominant.index) & 0x1F) as u8;
+    let tertiary_delta = ((third.index ^ dominant.index) & 0x1F) as u8;
+    let fingerprint_bias = (signature.fingerprint & 0x1F) as u8;
+
+    MagicKey::from_operator_blueprint(&OperatorBlueprint {
+        dominant_index: dominant.index as u16,
+        dominant_positive: !dominant.coefficient.is_sign_negative(),
+        primary_shift: shift.shift as u8,
+        shift_match: shift_match as u16,
+        derivative_density: derivative_signature as u8,
+        popcnt_density: popcnt_signature as u8,
         secondary_delta,
         tertiary_delta,
-        fingerprint_bias:   (sig.fingerprint & 0x1F) as u8,
-    };
-
-    MagicKey::from_operator_blueprint(&bp)
+        fingerprint_bias,
+    })
 }
 
-/// Derive a `Spectral`-tagged `MagicKey` from a `TopologySignature`.
-///
-/// Uses `sig.bit_len` as the authoritative block size so that uniform blocks
-/// (whose only Walsh peak is the DC component at index 0) produce a correct key.
-pub fn compile_spectral_key(sig: &TopologySignature) -> Result<MagicKey, String> {
-    if sig.walsh_peaks.is_empty() {
-        return Err("compile_spectral_key: signature has no Walsh peaks".to_string());
+fn quantize_ratio(numerator: usize, denominator: usize, bits: u8) -> u64 {
+    if denominator == 0 {
+        return 0;
     }
+    let max = (1_u64 << bits) - 1;
+    ((numerator as u128 * max as u128 + (denominator as u128 / 2)) / denominator as u128) as u64
+}
 
-    // Use the authoritative bit_len from the signature, not a guess from peak indices.
-    let bit_len = sig.bit_len;
-    if bit_len == 0 || !bit_len.is_power_of_two() {
-        return Err(format!(
-            "compile_spectral_key: invalid bit_len {bit_len}"
-        ));
+pub fn compile_spectral_key(signature: &TopologySignature) -> Result<MagicKey, String> {
+    if signature.bit_len == 0 || !signature.bit_len.is_power_of_two() {
+        return Err("signature bit length must be a power of two".to_string());
     }
-
-    let peaks: Vec<SpectralPeakCode> = sig.walsh_peaks
+    let strongest = signature
+        .walsh_peaks
         .iter()
-        .take(2)
-        .map(|p| SpectralPeakCode {
-            index:     p.index.min(bit_len - 1),
-            positive:  p.coefficient > 0.0,
-            amplitude: (p.coefficient.abs().min(63.0) as u8).max(1),
+        .map(|peak| peak.coefficient.abs())
+        .fold(0.0_f64, f64::max);
+    let peaks = signature
+        .walsh_peaks
+        .iter()
+        .filter(|peak| peak.coefficient.abs() > 1e-12)
+        .take(MAX_SPECTRAL_PEAKS)
+        .map(|peak| SpectralPeakCode {
+            index: peak.index,
+            positive: !peak.coefficient.is_sign_negative(),
+            amplitude: ((peak.coefficient.abs() / strongest * 31.0).round() as u8).max(1),
         })
-        .collect();
-
-    let tie_bit = sig.walsh_peaks.first().map(|p| p.coefficient > 0.0).unwrap_or(false);
-
-    MagicKey::from_spectral_program(&SpectralProgram { bit_len, peaks, tie_bit })
+        .collect::<Vec<_>>();
+    let derivative_ones = signature.derivative.iter().filter(|bit| **bit == 1).count();
+    let popcnt_sum = signature
+        .popcnt_profile
+        .iter()
+        .map(|count| *count as usize)
+        .sum::<usize>();
+    MagicKey::from_spectral_program(&SpectralProgram {
+        bit_len: signature.bit_len,
+        peaks,
+        tie_bit: ((derivative_ones ^ popcnt_sum) & 1) == 1,
+    })
 }
 
-/// Compute a 48-bit XOR-fold fingerprint of `block` for trajectory key seeding.
-pub fn block_fingerprint(block: &[u8]) -> Result<u64, String> {
-    if block.is_empty() {
-        return Err("block_fingerprint: empty block".to_string());
+fn validate_bits(bits: &[u8]) -> Result<(), String> {
+    if bits.iter().any(|bit| *bit > 1) {
+        return Err("bit vector contains values other than zero or one".to_string());
     }
-    let fp = block
-        .chunks(6)
-        .fold(0_u64, |acc, chunk| {
-            let mut word = 0_u64;
-            for (i, &b) in chunk.iter().enumerate() {
-                word |= (b as u64) << (i * 8);
-            }
-            acc ^ word
-        })
-        & 0x0000_FFFF_FFFF_FFFF;
-    Ok(fp)
+    Ok(())
+}
+
+fn avalanche(mut value: u64) -> u64 {
+    value ^= value >> 30;
+    value = value.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    value ^= value >> 27;
+    value = value.wrapping_mul(0x94D0_49BB_1331_11EB);
+    value ^ (value >> 31)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::domain::kernel::key::MagicKeyKind;
+    use super::{
+        analyze_topology, block_fingerprint, circular_bit_derivative, compile_spectral_key,
+        compile_topology_to_key, popcnt_profile, shift_correlation, MAX_SPECTRAL_PEAKS,
+    };
 
-    fn sequential_block(len: usize) -> Vec<u8> {
-        (0..len).map(|i| i as u8).collect()
+    #[test]
+    fn derivative_is_xor_with_requested_circular_shift() {
+        let bits = [0, 0, 1, 1, 0, 1, 0, 1];
+        assert_eq!(
+            circular_bit_derivative(&bits, 1).unwrap(),
+            vec![0, 1, 0, 1, 1, 1, 1, 1]
+        );
     }
 
     #[test]
-    fn analyze_topology_rejects_non_power_of_two_bit_len() {
-        assert!(analyze_topology(&[0u8; 3]).is_err());
-        assert!(analyze_topology(&[0u8; 0]).is_err());
+    fn shift_correlation_detects_periodic_topology() {
+        let bits = [0, 1, 0, 1, 0, 1, 0, 1];
+        assert_eq!(
+            shift_correlation(&bits, 2).unwrap().matching_bits,
+            bits.len()
+        );
+        assert_eq!(shift_correlation(&bits, 1).unwrap().matching_bits, 0);
     }
 
     #[test]
-    fn analyze_topology_accepts_valid_blocks() {
-        for &len in &[1usize, 8, 64, 512] {
-            let block = sequential_block(len);
-            assert!(analyze_topology(&block).is_ok(), "failed for len={len}");
-        }
+    fn popcnt_profile_counts_each_window_exactly() {
+        let bytes = [0x00, 0xFF, 0x0F, 0x01];
+        assert_eq!(popcnt_profile(&bytes, 2).unwrap(), vec![8, 5]);
     }
 
     #[test]
-    fn topology_carries_correct_bit_len() {
-        for &len in &[8usize, 64, 512] {
-            let sig = analyze_topology(&sequential_block(len)).unwrap();
-            assert_eq!(sig.bit_len, len * 8, "bit_len wrong for block len={len}");
-        }
+    fn topology_compiler_is_deterministic_and_uses_all_required_profiles() {
+        let input = [0xAA_u8; 64];
+        let signature = analyze_topology(&input).unwrap();
+        let first = compile_topology_to_key(&signature).unwrap();
+        let second = compile_topology_to_key(&signature).unwrap();
+        assert_eq!(first, second);
+
+        assert_eq!(first.encoded_bit_len(), 64);
+        assert_ne!(first.raw(), 0);
+        assert!(first.spectral_program().is_err());
+
+        let spectral = compile_spectral_key(&signature).unwrap();
+        let program = spectral.spectral_program().unwrap();
+        assert_eq!(program.bit_len, signature.bit_len);
+        assert_eq!(
+            program.peaks.len(),
+            signature
+                .walsh_peaks
+                .iter()
+                .filter(|peak| peak.coefficient.abs() > 1e-12)
+                .count()
+                .min(MAX_SPECTRAL_PEAKS)
+        );
+        assert_eq!(spectral.serialize().len(), 8);
     }
 
     #[test]
-    fn compile_topology_to_key_returns_operator_kind() {
-        let block = sequential_block(64);
-        let sig = analyze_topology(&block).unwrap();
-        let key = compile_topology_to_key(&sig).unwrap();
-        assert!(key.require_kind(MagicKeyKind::Operator).is_ok());
+    fn changing_block_topology_changes_compiled_k() {
+        let left = compile_topology_to_key(&analyze_topology(&[0xAA; 64]).unwrap()).unwrap();
+        let right = compile_topology_to_key(&analyze_topology(&[0xF0; 64]).unwrap()).unwrap();
+        assert_ne!(left.serialize(), right.serialize());
     }
 
     #[test]
-    fn compile_spectral_key_returns_spectral_kind() {
-        let block = sequential_block(64);
-        let sig = analyze_topology(&block).unwrap();
-        let key = compile_spectral_key(&sig).unwrap();
-        assert!(key.require_kind(MagicKeyKind::Spectral).is_ok());
+    fn operator_key_exposes_structural_topology_fields() {
+        let signature = analyze_topology(&[0xA5; 64]).unwrap();
+        let key = compile_topology_to_key(&signature).unwrap();
+        let blueprint = key.operator_blueprint().unwrap();
+        assert_eq!(
+            usize::from(blueprint.dominant_index),
+            signature.walsh_peaks[0].index
+        );
+        assert_eq!(
+            blueprint.dominant_positive,
+            !signature.walsh_peaks[0].coefficient.is_sign_negative()
+        );
+        assert_eq!(
+            usize::from(blueprint.primary_shift),
+            signature.shift_scores[0].shift
+        );
+        assert_eq!(
+            blueprint.fingerprint_bias,
+            (signature.fingerprint & 0x1F) as u8
+        );
     }
 
     #[test]
-    fn compile_spectral_key_uniform_block_uses_correct_bit_len() {
-        // Uniform block: DC-only Walsh peak at index 0.
-        // Without sig.bit_len the old code inferred bit_len=8 for any block size.
-        let block = vec![0xAAu8; 512]; // 4096 bits
-        let sig = analyze_topology(&block).unwrap();
-        assert_eq!(sig.bit_len, 4096);
-        let key = compile_spectral_key(&sig).unwrap();
-        // The spectral program must know bit_len=4096, not 8
-        let prog = key.spectral_program().unwrap();
-        assert_eq!(prog.bit_len, 4096, "spectral program bit_len must match block");
+    fn every_topology_profile_materially_changes_compiled_k() {
+        let signature = analyze_topology(&[0xA5; 64]).unwrap();
+        let baseline = compile_topology_to_key(&signature).unwrap().serialize();
+
+        let mut changed = signature.clone();
+        changed.walsh_peaks[0].index = (changed.walsh_peaks[0].index + 1) % changed.bit_len;
+        assert_ne!(
+            compile_topology_to_key(&changed).unwrap().serialize(),
+            baseline
+        );
+
+        let mut changed = signature.clone();
+        changed.shift_scores[0].shift = if changed.shift_scores[0].shift == 32 {
+            31
+        } else {
+            changed.shift_scores[0].shift + 1
+        };
+        assert_ne!(
+            compile_topology_to_key(&changed).unwrap().serialize(),
+            baseline
+        );
+
+        let mut changed = signature.clone();
+        changed.derivative[0] ^= 1;
+        assert_ne!(
+            compile_topology_to_key(&changed).unwrap().serialize(),
+            baseline
+        );
+
+        let mut changed = signature.clone();
+        changed.popcnt_profile[0] ^= 1;
+        assert_ne!(
+            compile_topology_to_key(&changed).unwrap().serialize(),
+            baseline
+        );
+
+        let mut changed = signature;
+        changed.fingerprint ^= 1;
+        assert_ne!(
+            compile_topology_to_key(&changed).unwrap().serialize(),
+            baseline
+        );
     }
 
     #[test]
-    fn different_blocks_produce_different_topology_keys() {
-        let left  = sequential_block(64);
-        let right: Vec<u8> = (0..64).map(|i| (i as u8).wrapping_mul(7)).collect();
-        let lk = compile_topology_to_key(&analyze_topology(&left).unwrap()).unwrap();
-        let rk = compile_topology_to_key(&analyze_topology(&right).unwrap()).unwrap();
-        assert_ne!(lk, rk);
-    }
+    fn block_fingerprint_depends_on_the_entire_block() {
+        let mut left = vec![0xAA; 512];
+        let mut right = left.clone();
+        right[511] ^= 1;
+        assert_ne!(
+            block_fingerprint(&left).unwrap(),
+            block_fingerprint(&right).unwrap()
+        );
 
-    #[test]
-    fn block_fingerprint_is_deterministic() {
-        let b = sequential_block(64);
-        assert_eq!(block_fingerprint(&b).unwrap(), block_fingerprint(&b).unwrap());
-    }
-
-    #[test]
-    fn block_fingerprint_rejects_empty() {
-        assert!(block_fingerprint(&[]).is_err());
-    }
-
-    #[test]
-    fn topology_shift_scores_has_32_entries() {
-        let sig = analyze_topology(&sequential_block(64)).unwrap();
-        assert_eq!(sig.shift_scores.len(), 32);
+        left[0] ^= 1;
+        assert_ne!(
+            block_fingerprint(&left).unwrap(),
+            block_fingerprint(&right).unwrap()
+        );
     }
 }
