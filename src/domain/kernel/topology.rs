@@ -47,6 +47,26 @@ pub struct TopologySignature {
     pub popcnt_profile: Vec<u8>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StrictKeyLayout {
+    pub phase_bits: u8,
+    pub affine_bits: u8,
+    pub shift_bits: u8,
+    pub rotate_bits: u8,
+    pub lane_bits: u8,
+    pub multiplier_bits: u8,
+    pub parity_bits: u8,
+    pub affine_present: bool,
+    pub lane_present: bool,
+    pub parity_present: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StrictOperatorKey {
+    pub bit_len: u16,
+    pub bytes: Vec<u8>,
+}
+
 pub fn bytes_to_bits(bytes: &[u8]) -> Vec<u8> {
     bytes
         .iter()
@@ -270,7 +290,7 @@ pub fn compile_spectral_key(signature: &TopologySignature) -> Result<MagicKey, S
 pub fn compile_strict_operator_key(
     signature: &TopologySignature,
     window_bits: usize,
-) -> Result<u64, String> {
+) -> Result<StrictOperatorKey, String> {
     if signature.bit_len != window_bits {
         return Err("signature bit length does not match the selected window".to_string());
     }
@@ -291,39 +311,281 @@ pub fn compile_strict_operator_key(
         .unwrap_or(shift0)
         .max(1);
     let derivative_ones = signature.derivative.iter().filter(|bit| **bit == 1).count();
-    let derivative_density =
-        (derivative_ones * 255 / signature.derivative.len().max(1)).min(255) as u8;
+    let derivative_density = (derivative_ones * 1024 / signature.derivative.len().max(1)).min(1024);
     let popcnt_sum = signature
         .popcnt_profile
         .iter()
         .map(|count| *count as usize)
         .sum::<usize>();
     let popcnt_mean = (popcnt_sum / signature.popcnt_profile.len().max(1)).min(255) as u8;
-    let popcnt_first = signature.popcnt_profile.first().copied().unwrap_or(0);
-    let dominance = signature
+    let popcnt_first = signature.popcnt_profile.first().copied().unwrap_or(0) as usize;
+    let dominance_total = signature
         .walsh_peaks
         .iter()
         .map(|peak| peak.coefficient.unsigned_abs() as usize)
         .sum::<usize>()
         .max(1);
-    let dominance_byte =
-        ((peak0.coefficient.unsigned_abs() as usize * 255) / dominance).min(255) as u8;
-    let rounds =
-        (((dominance_byte as usize + derivative_density as usize) / 32).clamp(1, 15) as u8) & 0x0F;
-    let routing = if shift0 >= shift1 { 0b01 } else { 0b10 };
-    let family = if peak0.coefficient >= 0 { 0b01 } else { 0b10 };
+    let dominance_ratio =
+        (peak0.coefficient.unsigned_abs() as usize * 1024 / dominance_total).min(1024);
+    let shift_coherence =
+        (signature.shift_scores[0].matching_bits * 1024 / signature.bit_len.max(1)).min(1024);
+    let word_count = (window_bits / 64).max(1);
+    let layout = StrictKeyLayout {
+        phase_bits: if dominance_ratio >= 768 {
+            24
+        } else if dominance_ratio >= 512 {
+            16
+        } else {
+            12
+        },
+        affine_bits: if derivative_density >= 448 {
+            if shift_coherence >= 704 {
+                24
+            } else {
+                16
+            }
+        } else {
+            0
+        },
+        shift_bits: if window_bits >= 16384 {
+            6
+        } else if window_bits >= 4096 {
+            5
+        } else {
+            4
+        },
+        rotate_bits: if dominance_ratio >= 640 { 6 } else { 5 },
+        lane_bits: 6,
+        multiplier_bits: if derivative_density >= 640 {
+            32
+        } else if shift_coherence >= 640 {
+            24
+        } else {
+            16
+        },
+        parity_bits: 5,
+        affine_present: derivative_density >= 448,
+        lane_present: word_count > 1 && shift_coherence >= 384,
+        parity_present: derivative_density >= 256,
+    };
 
-    let bytes = [
-        (peak0.index & 0xFF) as u8,
-        ((peak0.index >> 8) as u8) ^ popcnt_first,
-        (peak1.index & 0xFF) as u8,
-        ((peak1.index >> 8) as u8) ^ popcnt_mean,
-        (shift0.min(63)) as u8,
-        (shift1.min(63)) as u8,
-        derivative_density,
-        dominance_byte ^ ((rounds << 4) | (family << 2) | routing),
-    ];
-    Ok(u64::from_le_bytes(bytes))
+    let mut writer = BitWriter::default();
+    writer.push_bits((layout.phase_bits / 4 - 3) as u64, 2);
+    writer.push_bits(
+        if layout.affine_present {
+            (layout.affine_bits / 8).saturating_sub(2) as u64
+        } else {
+            0
+        },
+        2,
+    );
+    writer.push_bits(layout.shift_bits.saturating_sub(3) as u64, 2);
+    writer.push_bits(layout.rotate_bits.saturating_sub(4) as u64, 2);
+    writer.push_bits((layout.multiplier_bits / 8 - 2).into(), 3);
+    writer.push_bits(u64::from(layout.affine_present), 1);
+    writer.push_bits(u64::from(layout.lane_present), 1);
+    writer.push_bits(u64::from(layout.parity_present), 1);
+
+    let phase_seed = mix_feature_word(signature, peak0.index ^ shift0 ^ popcnt_first);
+    writer.push_bits(phase_seed, layout.phase_bits);
+    if layout.affine_present {
+        let affine_seed = mix_feature_word(
+            signature,
+            peak1.index ^ shift1 ^ usize::from(popcnt_mean) ^ derivative_ones,
+        );
+        writer.push_bits(affine_seed, layout.affine_bits);
+    }
+
+    let shift_mask = (1_u64 << layout.shift_bits) - 1;
+    writer.push_bits(
+        (shift0 as u64).wrapping_sub(1) & shift_mask,
+        layout.shift_bits,
+    );
+    writer.push_bits(
+        (shift1 as u64).wrapping_sub(1) & shift_mask,
+        layout.shift_bits,
+    );
+
+    let rotate_mask = (1_u64 << layout.rotate_bits) - 1;
+    writer.push_bits((peak0.index as u64) & rotate_mask, layout.rotate_bits);
+    writer.push_bits((peak1.index as u64) & rotate_mask, layout.rotate_bits);
+
+    if layout.lane_present {
+        let lane_mask = (1_u64 << layout.lane_bits) - 1;
+        writer.push_bits((shift0 as u64) & lane_mask, layout.lane_bits);
+    }
+
+    let multiplier_seed = mix_feature_word(
+        signature,
+        shift0 ^ shift1 ^ peak0.index ^ (derivative_density << 3),
+    ) | 1;
+    writer.push_bits(multiplier_seed, layout.multiplier_bits);
+
+    if layout.parity_present {
+        let parity_mask = (1_u64 << layout.parity_bits) - 1;
+        writer.push_bits((derivative_ones as u64) & parity_mask, layout.parity_bits);
+    }
+
+    Ok(StrictOperatorKey {
+        bit_len: writer.bit_len as u16,
+        bytes: writer.finish(),
+    })
+}
+
+pub fn parse_strict_key_layout(bit_len: u16, bytes: &[u8]) -> Result<StrictKeyLayout, String> {
+    let expected_bytes = (bit_len as usize).div_ceil(8);
+    if bytes.len() != expected_bytes {
+        return Err("strict operator K byte length is not canonical".to_string());
+    }
+    if bit_len < 14 {
+        return Err("strict operator K is too short for the required header".to_string());
+    }
+    if let Some(last) = bytes.last().copied() {
+        let used_bits = (bit_len as usize) % 8;
+        if used_bits != 0 && (last >> used_bits) != 0 {
+            return Err("strict operator K has non-canonical trailing padding bits".to_string());
+        }
+    }
+
+    let mut reader = BitReader::new(bytes, bit_len);
+    let phase_bits = match reader.read_bits(2)? as u8 {
+        0 => 12,
+        1 => 16,
+        2 => 20,
+        _ => 24,
+    };
+    let affine_code = reader.read_bits(2)? as u8;
+    let shift_bits = reader.read_bits(2)? as u8 + 3;
+    let rotate_bits = reader.read_bits(2)? as u8 + 4;
+    let multiplier_bits = (reader.read_bits(3)? as u8 + 2) * 8;
+    let affine_present = reader.read_bits(1)? != 0;
+    let lane_present = reader.read_bits(1)? != 0;
+    let parity_present = reader.read_bits(1)? != 0;
+    let affine_bits = if affine_present {
+        (affine_code + 2) * 8
+    } else {
+        0
+    };
+    let lane_bits = 6;
+    let parity_bits = if parity_present { 5 } else { 0 };
+    let minimum_bits = 14
+        + phase_bits as usize
+        + affine_bits as usize
+        + shift_bits as usize * 2
+        + rotate_bits as usize * 2
+        + if lane_present { lane_bits as usize } else { 0 }
+        + multiplier_bits as usize
+        + if parity_present {
+            parity_bits as usize
+        } else {
+            0
+        };
+    if minimum_bits > bit_len as usize {
+        return Err(
+            "strict operator K field widths exceed the declared key bit length".to_string(),
+        );
+    }
+    Ok(StrictKeyLayout {
+        phase_bits,
+        affine_bits,
+        shift_bits,
+        rotate_bits,
+        lane_bits,
+        multiplier_bits,
+        parity_bits,
+        affine_present,
+        lane_present,
+        parity_present,
+    })
+}
+
+fn mix_feature_word(signature: &TopologySignature, salt: usize) -> u64 {
+    let derivative_fold =
+        signature
+            .derivative
+            .chunks(64)
+            .enumerate()
+            .fold(0_u64, |acc, (index, chunk)| {
+                let parity = chunk.iter().fold(0_u8, |bit, value| bit ^ *value);
+                acc ^ ((parity as u64) << (index % 64))
+            });
+    let popcnt_fold = signature
+        .popcnt_profile
+        .iter()
+        .enumerate()
+        .fold(0_u64, |acc, (index, value)| {
+            acc.rotate_left(7) ^ ((*value as u64) << ((index * 5) % 56))
+        });
+    let spectral_fold =
+        signature
+            .walsh_peaks
+            .iter()
+            .enumerate()
+            .fold(0_u64, |acc, (index, peak)| {
+                acc.rotate_left(11)
+                    ^ (peak.coefficient.unsigned_abs() as u64)
+                    ^ ((peak.index as u64) << ((index * 9) % 32))
+            });
+    avalanche(
+        derivative_fold
+            ^ popcnt_fold
+            ^ spectral_fold
+            ^ (salt as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+    )
+}
+
+#[derive(Default)]
+struct BitWriter {
+    bytes: Vec<u8>,
+    bit_len: usize,
+}
+
+impl BitWriter {
+    fn push_bits(&mut self, value: u64, bit_count: u8) {
+        for bit_index in 0..bit_count {
+            let bit = ((value >> bit_index) & 1) as u8;
+            let byte_index = self.bit_len / 8;
+            if self.bytes.len() == byte_index {
+                self.bytes.push(0);
+            }
+            self.bytes[byte_index] |= bit << (self.bit_len % 8);
+            self.bit_len += 1;
+        }
+    }
+
+    fn finish(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+struct BitReader<'a> {
+    bytes: &'a [u8],
+    bit_len: u16,
+    cursor: usize,
+}
+
+impl<'a> BitReader<'a> {
+    fn new(bytes: &'a [u8], bit_len: u16) -> Self {
+        Self {
+            bytes,
+            bit_len,
+            cursor: 0,
+        }
+    }
+
+    fn read_bits(&mut self, bit_count: u8) -> Result<u64, String> {
+        if self.cursor + bit_count as usize > self.bit_len as usize {
+            return Err("strict operator K is truncated".to_string());
+        }
+        let mut value = 0_u64;
+        for bit_index in 0..bit_count as usize {
+            let absolute = self.cursor + bit_index;
+            let bit = (self.bytes[absolute / 8] >> (absolute % 8)) & 1;
+            value |= (bit as u64) << bit_index;
+        }
+        self.cursor += bit_count as usize;
+        Ok(value)
+    }
 }
 
 fn integer_fwht(values: &mut [i32]) -> Result<(), String> {
@@ -601,11 +863,13 @@ mod tests {
     }
 
     #[test]
-    fn strict_operator_key_is_exactly_64_bits() {
+    fn strict_operator_key_is_variable_length_and_canonical() {
         let input = [0x42_u8; 512];
         let signature = analyze_topology(&input).unwrap();
         let key = compile_strict_operator_key(&signature, input.len() * 8).unwrap();
-        assert_eq!(key.to_le_bytes().len(), 8);
+        assert_eq!(key.bytes.len(), (key.bit_len as usize).div_ceil(8));
+        assert!(key.bit_len >= 12);
+        assert!(key.bytes.iter().any(|byte| *byte != 0));
     }
 
     /// Phase mask and affine mask must not be trivially correlated.

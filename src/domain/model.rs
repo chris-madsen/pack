@@ -76,8 +76,10 @@ pub struct TrajectoryBlock {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OperatorBlock {
     pub original_len: u32,
+    pub key_bits: u16,
     pub key: Vec<u8>,
     pub steps: u8,
+    pub breadcrumbs: Vec<u8>,
     pub terminal_mode: OperatorTerminalMode,
     pub terminal_payload: Vec<u8>,
 }

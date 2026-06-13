@@ -6,6 +6,7 @@ use crate::domain::kernel::reversible::{
     feistel_forward, feistel_inverse, FeistelKey, FeistelRoundKey,
 };
 use crate::domain::kernel::spectral::normalized_fwht;
+use crate::domain::kernel::topology::parse_strict_key_layout;
 
 pub const OPERATOR_BLOCK_WORDS: usize = 64;
 const SEED_MODE_RAW: u8 = 0;
@@ -253,33 +254,37 @@ pub fn strongest_binary_word_peaks(
     Ok(peaks)
 }
 
-pub fn apply_strict_operator_step(words: &mut [u64], key: u64) -> Result<(), String> {
+pub fn apply_strict_operator_step(
+    words: &mut [u64],
+    key_bits: u16,
+    key: &[u8],
+) -> Result<(), String> {
     if words.is_empty() || !words.len().is_power_of_two() {
         return Err("strict operator requires a non-empty power-of-two word slice".to_string());
     }
-    let bytes = key.to_le_bytes();
-    apply_strict_routing_forward(words, &bytes);
-    if strict_uses_butterfly(&bytes) {
-        apply_slice_butterfly_forward(words);
-    }
+    let params = parse_strict_params(key_bits, key)?;
+    words.rotate_left(params.lane_rotate % words.len());
+    apply_slice_butterfly_forward(words);
     for (index, word) in words.iter_mut().enumerate() {
-        *word = strict_word_forward(*word, &bytes, index);
+        *word = strict_word_forward(*word, &params, index);
     }
     Ok(())
 }
 
-pub fn apply_strict_operator_inverse_step(words: &mut [u64], key: u64) -> Result<(), String> {
+pub fn apply_strict_operator_inverse_step(
+    words: &mut [u64],
+    key_bits: u16,
+    key: &[u8],
+) -> Result<(), String> {
     if words.is_empty() || !words.len().is_power_of_two() {
         return Err("strict operator requires a non-empty power-of-two word slice".to_string());
     }
-    let bytes = key.to_le_bytes();
+    let params = parse_strict_params(key_bits, key)?;
     for (index, word) in words.iter_mut().enumerate() {
-        *word = strict_word_inverse(*word, &bytes, index);
+        *word = strict_word_inverse(*word, &params, index);
     }
-    if strict_uses_butterfly(&bytes) {
-        apply_slice_butterfly_inverse(words);
-    }
-    apply_strict_routing_inverse(words, &bytes);
+    apply_slice_butterfly_inverse(words);
+    words.rotate_right(params.lane_rotate % words.len());
     Ok(())
 }
 
@@ -462,92 +467,126 @@ fn apply_slice_butterfly_inverse(words: &mut [u64]) {
     }
 }
 
-fn strict_word_forward(value: u64, key_bytes: &[u8; 8], word_index: usize) -> u64 {
-    let phase = strict_phase_mask(key_bytes, word_index);
-    let affine = strict_affine_mask(key_bytes, word_index);
-    let rotate_left = strict_rotate_left(key_bytes, word_index);
-    let rotate_right = strict_rotate_right(key_bytes, word_index);
-    let shift = strict_shift(key_bytes, word_index);
-    let mut out = value ^ phase;
-    out = out.rotate_left(rotate_left);
-    out = gf2_right_mix_forward(out, shift);
-    out ^= affine;
-    out.rotate_right(rotate_right)
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StrictOperatorParams {
+    phase_seed: u64,
+    affine_seed: u64,
+    shift_alpha: u8,
+    shift_beta: u8,
+    rotate_alpha: u8,
+    rotate_beta: u8,
+    lane_rotate: usize,
+    parity_seed: u8,
+    odd_multiplier: u64,
 }
 
-fn strict_word_inverse(value: u64, key_bytes: &[u8; 8], word_index: usize) -> u64 {
-    let phase = strict_phase_mask(key_bytes, word_index);
-    let affine = strict_affine_mask(key_bytes, word_index);
-    let rotate_left = strict_rotate_left(key_bytes, word_index);
-    let rotate_right = strict_rotate_right(key_bytes, word_index);
-    let shift = strict_shift(key_bytes, word_index);
-    let mut out = value.rotate_left(rotate_right);
+fn strict_word_forward(value: u64, params: &StrictOperatorParams, word_index: usize) -> u64 {
+    let phase = strict_phase_mask(params.phase_seed, params.parity_seed, word_index);
+    let affine = strict_affine_mask(params.affine_seed, params.parity_seed, word_index);
+    let mut out = value ^ phase;
+    out = out.rotate_left(params.rotate_alpha as u32);
+    out = gf2_right_mix_forward(out, params.shift_alpha);
+    out = out.wrapping_mul(params.odd_multiplier);
+    out = gf2_right_mix_forward(out, params.shift_beta);
     out ^= affine;
-    out = gf2_right_mix_inverse(out, shift);
-    out = out.rotate_right(rotate_left);
+    out.rotate_right(params.rotate_beta as u32)
+}
+
+fn strict_word_inverse(value: u64, params: &StrictOperatorParams, word_index: usize) -> u64 {
+    let phase = strict_phase_mask(params.phase_seed, params.parity_seed, word_index);
+    let affine = strict_affine_mask(params.affine_seed, params.parity_seed, word_index);
+    let mut out = value.rotate_left(params.rotate_beta as u32);
+    out ^= affine;
+    out = gf2_right_mix_inverse(out, params.shift_beta);
+    out = out.wrapping_mul(mod_inverse_odd_u64(params.odd_multiplier));
+    out = gf2_right_mix_inverse(out, params.shift_alpha);
+    out = out.rotate_right(params.rotate_alpha as u32);
     out ^ phase
 }
 
-fn strict_phase_mask(key_bytes: &[u8; 8], word_index: usize) -> u64 {
-    let mut bytes = [0_u8; 8];
-    for (slot, byte) in bytes.iter_mut().enumerate() {
-        *byte = key_bytes[(slot + word_index) % key_bytes.len()]
-            .rotate_left(((slot + word_index) % 8) as u32);
+fn strict_phase_mask(seed: u64, parity_seed: u8, word_index: usize) -> u64 {
+    seed.rotate_left(((word_index * 7) % 64) as u32)
+        ^ repeat_byte(parity_seed).rotate_right(((word_index * 3) % 64) as u32)
+}
+
+fn strict_affine_mask(seed: u64, parity_seed: u8, word_index: usize) -> u64 {
+    seed.rotate_right(((word_index * 11) % 64) as u32)
+        ^ repeat_byte(parity_seed.wrapping_mul(17)).rotate_left(((word_index * 5) % 64) as u32)
+}
+
+fn parse_strict_params(key_bits: u16, key: &[u8]) -> Result<StrictOperatorParams, String> {
+    let layout = parse_strict_key_layout(key_bits, key)?;
+    let mut reader = StrictBitReader::new(key, key_bits);
+    let _phase_code = reader.read_bits(2)?;
+    let _affine_code = reader.read_bits(2)?;
+    let _shift_code = reader.read_bits(2)?;
+    let _rotate_code = reader.read_bits(2)?;
+    let _mult_code = reader.read_bits(3)?;
+    let _affine_present = reader.read_bits(1)? != 0;
+    let lane_present = reader.read_bits(1)? != 0;
+    let parity_present = reader.read_bits(1)? != 0;
+
+    let phase_seed = reader.read_bits(layout.phase_bits)?;
+    let affine_seed = if layout.affine_present {
+        reader.read_bits(layout.affine_bits)?
+    } else {
+        phase_seed.rotate_left(29) ^ 0xA5A5_5A5A_A5A5_5A5A
+    };
+    let shift_alpha = (reader.read_bits(layout.shift_bits)? as u8 % 63) + 1;
+    let shift_beta = (reader.read_bits(layout.shift_bits)? as u8 % 63) + 1;
+    let rotate_alpha = (reader.read_bits(layout.rotate_bits)? as u8 % 63) + 1;
+    let rotate_beta = (reader.read_bits(layout.rotate_bits)? as u8 % 63) + 1;
+    let lane_rotate = if lane_present {
+        reader.read_bits(layout.lane_bits)? as usize
+    } else {
+        0
+    };
+    let odd_multiplier = reader.read_bits(layout.multiplier_bits)? | 1;
+    let parity_seed = if parity_present {
+        reader.read_bits(layout.parity_bits)? as u8
+    } else {
+        0
+    };
+    Ok(StrictOperatorParams {
+        phase_seed,
+        affine_seed,
+        shift_alpha,
+        shift_beta,
+        rotate_alpha,
+        rotate_beta,
+        lane_rotate,
+        parity_seed,
+        odd_multiplier,
+    })
+}
+
+struct StrictBitReader<'a> {
+    bytes: &'a [u8],
+    bit_len: u16,
+    cursor: usize,
+}
+
+impl<'a> StrictBitReader<'a> {
+    fn new(bytes: &'a [u8], bit_len: u16) -> Self {
+        Self {
+            bytes,
+            bit_len,
+            cursor: 0,
+        }
     }
-    u64::from_le_bytes(bytes).rotate_left(((word_index * 7) % 64) as u32)
-}
 
-fn strict_affine_mask(key_bytes: &[u8; 8], word_index: usize) -> u64 {
-    let mut bytes = [0_u8; 8];
-    for (slot, byte) in bytes.iter_mut().enumerate() {
-        *byte = key_bytes
-            [(key_bytes.len() + slot - (word_index % key_bytes.len())) % key_bytes.len()]
-        .wrapping_add((slot as u8).wrapping_mul(17));
-    }
-    u64::from_le_bytes(bytes).rotate_right(((word_index * 11) % 64) as u32)
-}
-
-fn strict_rotate_left(key_bytes: &[u8; 8], word_index: usize) -> u32 {
-    (u32::from(key_bytes[4].wrapping_add(word_index as u8)) % 63) + 1
-}
-
-fn strict_rotate_right(key_bytes: &[u8; 8], word_index: usize) -> u32 {
-    (u32::from(key_bytes[2].wrapping_add((word_index as u8).wrapping_mul(3))) % 63) + 1
-}
-
-fn strict_shift(key_bytes: &[u8; 8], word_index: usize) -> u8 {
-    ((key_bytes[5].wrapping_add((word_index as u8).wrapping_mul(5))) % 63) + 1
-}
-
-fn strict_lane_rotate(key_bytes: &[u8; 8], len: usize) -> usize {
-    usize::from(key_bytes[6]) % len.max(1)
-}
-
-fn strict_uses_butterfly(key_bytes: &[u8; 8]) -> bool {
-    key_bytes[7] & 0x01 != 0
-}
-
-fn apply_strict_routing_forward(words: &mut [u64], key_bytes: &[u8; 8]) {
-    if words.is_empty() {
-        return;
-    }
-    match (key_bytes[7] >> 1) & 0x03 {
-        0 => {}
-        1 => words.rotate_left(strict_lane_rotate(key_bytes, words.len())),
-        2 => words.rotate_right(strict_lane_rotate(key_bytes, words.len())),
-        _ => words.reverse(),
-    }
-}
-
-fn apply_strict_routing_inverse(words: &mut [u64], key_bytes: &[u8; 8]) {
-    if words.is_empty() {
-        return;
-    }
-    match (key_bytes[7] >> 1) & 0x03 {
-        0 => {}
-        1 => words.rotate_right(strict_lane_rotate(key_bytes, words.len())),
-        2 => words.rotate_left(strict_lane_rotate(key_bytes, words.len())),
-        _ => words.reverse(),
+    fn read_bits(&mut self, bit_count: u8) -> Result<u64, String> {
+        if self.cursor + bit_count as usize > self.bit_len as usize {
+            return Err("strict operator key is truncated".to_string());
+        }
+        let mut value = 0_u64;
+        for bit_index in 0..bit_count as usize {
+            let absolute = self.cursor + bit_index;
+            let bit = (self.bytes[absolute / 8] >> (absolute % 8)) & 1;
+            value |= (bit as u64) << bit_index;
+        }
+        self.cursor += bit_count as usize;
+        Ok(value)
     }
 }
 

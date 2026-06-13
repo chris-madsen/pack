@@ -31,7 +31,6 @@ const RECURSIVE_HEADER_BYTES: usize = 27;
 const LAYER_SUMMARY_BYTES: usize = 18;
 const MIN_WINDOW_BYTES: usize = 16;
 const MAX_WINDOW_BYTES: usize = 2048;
-const MAX_STRICT_WINDOW_BYTES: usize = 16384;
 const MAX_STRICT_OPERATOR_STEPS: u8 = 64;
 const STRICT_GENERATOR_GAIN_FRACTION: f64 = 0.9;
 /// Byte length of the PACKMVP1 single-layer archive header:
@@ -299,6 +298,9 @@ fn analyze_pass_band(
     layer_index: usize,
     profile: CompressionProfile,
 ) -> Result<PassWindowBand, String> {
+    if profile == CompressionProfile::StrictGeneratorOnly {
+        return analyze_strict_pass_band(input, block_size_hint, layer_index);
+    }
     let available = candidate_window_sizes(input.len(), profile);
     let hint =
         block_size_hint.filter(|value| value.is_power_of_two() && *value >= MIN_WINDOW_BYTES);
@@ -356,10 +358,76 @@ fn analyze_pass_band(
     })
 }
 
+fn analyze_strict_pass_band(
+    input: &[u8],
+    block_size_hint: Option<usize>,
+    layer_index: usize,
+) -> Result<PassWindowBand, String> {
+    let available = candidate_window_sizes(input.len(), CompressionProfile::StrictGeneratorOnly);
+    let hint =
+        block_size_hint.filter(|value| value.is_power_of_two() && *value >= MIN_WINDOW_BYTES);
+    if available.is_empty() {
+        let bits = (input.len().max(1) * 8) as u32;
+        return Ok(PassWindowBand {
+            min_window_bits: bits,
+            max_window_bits: bits,
+        });
+    }
+
+    let mut scored = Vec::new();
+    for &size in &available {
+        let Some(prefix) = input.get(..size) else {
+            continue;
+        };
+        let Ok(signature) = analyze_topology(prefix) else {
+            continue;
+        };
+        scored.push((size, strict_window_metrics(&signature)));
+    }
+    if scored.is_empty() {
+        let fallback = hint.unwrap_or(*available.first().unwrap());
+        return Ok(PassWindowBand {
+            min_window_bits: (fallback * 8) as u32,
+            max_window_bits: (fallback * 8) as u32,
+        });
+    }
+
+    let best = scored
+        .iter()
+        .max_by_key(|(_, metrics)| metrics.score)
+        .map(|(_, metrics)| *metrics)
+        .unwrap();
+    let mut min_bytes = scored
+        .iter()
+        .find(|(_, metrics)| !metrics.noisy && metrics.score * 100 >= best.score * 72)
+        .map(|(size, _)| *size)
+        .unwrap_or(scored[0].0);
+    let mut max_bytes = scored
+        .iter()
+        .rev()
+        .find(|(_, metrics)| metrics.structured || metrics.score * 100 >= best.score * 88)
+        .map(|(size, _)| *size)
+        .unwrap_or(scored.last().unwrap().0);
+    if let Some(anchor) = hint {
+        min_bytes = min_bytes.min(anchor);
+        max_bytes = max_bytes.max(anchor).min(*available.last().unwrap());
+    }
+    if layer_index > 0 {
+        max_bytes = max_bytes.min((min_bytes * 4).max(min_bytes));
+    }
+    if min_bytes > max_bytes {
+        min_bytes = max_bytes;
+    }
+    Ok(PassWindowBand {
+        min_window_bits: (min_bytes * 8) as u32,
+        max_window_bits: (max_bytes * 8) as u32,
+    })
+}
+
 fn candidate_window_sizes(input_len: usize, profile: CompressionProfile) -> Vec<usize> {
     let cap = match profile {
         CompressionProfile::General => MAX_WINDOW_BYTES,
-        CompressionProfile::StrictGeneratorOnly => MAX_STRICT_WINDOW_BYTES,
+        CompressionProfile::StrictGeneratorOnly => input_len,
     };
     let capped = input_len.min(cap);
     let mut size = MIN_WINDOW_BYTES;
@@ -388,6 +456,29 @@ fn window_sizes_for_band(band: PassWindowBand) -> Result<Vec<usize>, String> {
         size *= 2;
     }
     Ok(out)
+}
+
+fn strict_window_metrics(signature: &TopologySignature) -> StrictWindowMetrics {
+    let dominance_total = signature
+        .walsh_peaks
+        .iter()
+        .map(|peak| peak.coefficient.unsigned_abs() as usize)
+        .sum::<usize>()
+        .max(1);
+    let dominance =
+        signature.walsh_peaks[0].coefficient.unsigned_abs() as usize * 1024 / dominance_total;
+    let shift_coherence = signature.shift_scores[0].matching_bits * 1024 / signature.bit_len.max(1);
+    let derivative_density = signature.derivative.iter().filter(|bit| **bit == 1).count() * 1024
+        / signature.derivative.len().max(1);
+    let score = dominance
+        .saturating_mul(2)
+        .saturating_add(shift_coherence)
+        .saturating_sub(derivative_density / 2);
+    StrictWindowMetrics {
+        score,
+        structured: dominance >= 576 && shift_coherence >= 544 && derivative_density <= 544,
+        noisy: derivative_density >= 704 && dominance <= 416,
+    }
 }
 
 fn select_block_window(input: &[u8], sizes: &[usize]) -> Result<(u8, usize), String> {
@@ -541,6 +632,13 @@ struct TerminalPalettePlan {
 struct OperatorTerminalCandidate {
     mode: OperatorTerminalMode,
     payload: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct StrictWindowMetrics {
+    score: usize,
+    structured: bool,
+    noisy: bool,
 }
 
 #[cfg(test)]
@@ -883,9 +981,7 @@ fn try_encode_operator_block(
         Some(sig) => sig.clone(),
         None => analyze_topology(block)?,
     };
-    let key = compile_strict_operator_key(&signature, block.len() * 8)?
-        .to_le_bytes()
-        .to_vec();
+    let key = compile_strict_operator_key(&signature, block.len() * 8)?;
     let mut words = block
         .chunks_exact(8)
         .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
@@ -899,23 +995,29 @@ fn try_encode_operator_block(
     };
     let mut best: Option<BlockEncoding> = None;
     for steps in 1..=MAX_STRICT_OPERATOR_STEPS {
-        apply_strict_operator_step(
-            &mut words,
-            u64::from_le_bytes(key.clone().try_into().unwrap()),
-        )?;
-        let Some(candidate) = build_operator_candidate(block.len() as u32, &key, steps, &words)?
+        apply_strict_operator_step(&mut words, key.bit_len, &key.bytes)?;
+        let Some(candidate) = build_operator_candidate(
+            block.len() as u32,
+            key.bit_len,
+            &key.bytes,
+            steps,
+            &[],
+            &words,
+            profile == CompressionProfile::General,
+        )?
         else {
             continue;
         };
         let operator = extract_operator_block(&candidate).unwrap();
         let overhead_bytes = encoded_size_of(&candidate)
             .checked_sub(operator.key.len())
+            .and_then(|value| value.checked_sub(operator.breadcrumbs.len()))
             .and_then(|value| value.checked_sub(operator.terminal_payload.len()))
             .ok_or_else(|| "operator block accounting underflow".to_string())?;
         let budget = BitBudget {
             source_bits: (block.len() * 8) as u64,
-            key_bits: 64,
-            crumb_bits: (operator.terminal_payload.len() * 8) as u64,
+            key_bits: key.bit_len as u64,
+            crumb_bits: (operator.breadcrumbs.len() * 8) as u64,
             overhead_bits: (overhead_bytes * 8) as u64,
         };
         if !policy.accepts(budget)? {
@@ -934,15 +1036,20 @@ fn try_encode_operator_block(
 
 fn build_operator_candidate(
     original_len: u32,
+    key_bits: u16,
     key: &[u8],
     steps: u8,
+    breadcrumbs: &[u8],
     words: &[u64],
+    allow_raw_terminal: bool,
 ) -> Result<Option<BlockEncoding>, String> {
-    let candidate = encode_best_operator_terminal(words)?.map(|terminal| {
+    let candidate = encode_best_operator_terminal(words, allow_raw_terminal)?.map(|terminal| {
         BlockEncoding::Operator(OperatorBlock {
             original_len,
+            key_bits,
             key: key.to_vec(),
             steps,
+            breadcrumbs: breadcrumbs.to_vec(),
             terminal_mode: terminal.mode,
             terminal_payload: terminal.payload,
         })
@@ -967,8 +1074,7 @@ fn debug_strict_operator_block(block: &[u8], offset: usize) -> Result<GeneratorD
         });
     }
     let signature = analyze_topology(block)?;
-    let key_u64 = compile_strict_operator_key(&signature, block.len() * 8)?;
-    let key = key_u64.to_le_bytes().to_vec();
+    let key = compile_strict_operator_key(&signature, block.len() * 8)?;
     let mut words = block
         .chunks_exact(8)
         .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
@@ -980,20 +1086,29 @@ fn debug_strict_operator_block(block: &[u8], offset: usize) -> Result<GeneratorD
     let mut best_observed: Option<(BlockEncoding, BitBudget)> = None;
     let mut best: Option<(BlockEncoding, BitBudget)> = None;
     for steps in 1..=MAX_STRICT_OPERATOR_STEPS {
-        apply_strict_operator_step(&mut words, key_u64)?;
-        let Some(candidate) = build_operator_candidate(block.len() as u32, &key, steps, &words)?
+        apply_strict_operator_step(&mut words, key.bit_len, &key.bytes)?;
+        let Some(candidate) = build_operator_candidate(
+            block.len() as u32,
+            key.bit_len,
+            &key.bytes,
+            steps,
+            &[],
+            &words,
+            false,
+        )?
         else {
             continue;
         };
         let operator = extract_operator_block(&candidate).unwrap();
         let overhead_bytes = encoded_size_of(&candidate)
             .checked_sub(operator.key.len())
+            .and_then(|value| value.checked_sub(operator.breadcrumbs.len()))
             .and_then(|value| value.checked_sub(operator.terminal_payload.len()))
             .ok_or_else(|| "operator block accounting underflow".to_string())?;
         let budget = BitBudget {
             source_bits: (block.len() * 8) as u64,
-            key_bits: 64,
-            crumb_bits: (operator.terminal_payload.len() * 8) as u64,
+            key_bits: key.bit_len as u64,
+            crumb_bits: (operator.breadcrumbs.len() * 8) as u64,
             overhead_bits: (overhead_bytes * 8) as u64,
         };
         if best_observed
@@ -1021,7 +1136,7 @@ fn debug_strict_operator_block(block: &[u8], offset: usize) -> Result<GeneratorD
             GeneratorDebugBlock {
                 offset,
                 window_bytes: block.len(),
-                key_hex: hex_string(&key),
+                key_hex: hex_string(&key.bytes),
                 steps: Some(operator.steps),
                 terminal_mode: Some(operator.terminal_mode),
                 key_bits: budget.key_bits,
@@ -1038,7 +1153,7 @@ fn debug_strict_operator_block(block: &[u8], offset: usize) -> Result<GeneratorD
                 GeneratorDebugBlock {
                     offset,
                     window_bytes: block.len(),
-                    key_hex: hex_string(&key),
+                    key_hex: hex_string(&key.bytes),
                     steps: Some(operator.steps),
                     terminal_mode: Some(operator.terminal_mode),
                     key_bits: budget.key_bits,
@@ -1052,13 +1167,13 @@ fn debug_strict_operator_block(block: &[u8], offset: usize) -> Result<GeneratorD
             None => GeneratorDebugBlock {
                 offset,
                 window_bytes: block.len(),
-                key_hex: hex_string(&key),
+                key_hex: hex_string(&key.bytes),
                 steps: None,
                 terminal_mode: None,
-                key_bits: 64,
+                key_bits: key.bit_len as u64,
                 crumb_bits: 0,
                 overhead_bits: 0,
-                total_bits: 64,
+                total_bits: key.bit_len as u64,
                 accepted: false,
                 reject_reason: "no-operator-candidate".to_string(),
             },
@@ -1068,6 +1183,7 @@ fn debug_strict_operator_block(block: &[u8], offset: usize) -> Result<GeneratorD
 
 fn encode_best_operator_terminal(
     words: &[u64],
+    allow_raw_terminal: bool,
 ) -> Result<Option<OperatorTerminalCandidate>, String> {
     if words.is_empty() {
         return Ok(None);
@@ -1085,10 +1201,12 @@ fn encode_best_operator_terminal(
     if let Some(sparse) = encode_operator_sparse_exceptions(words)? {
         candidates.push(sparse);
     }
-    candidates.push(OperatorTerminalCandidate {
-        mode: OperatorTerminalMode::RawTerminal,
-        payload: words.iter().flat_map(|word| word.to_le_bytes()).collect(),
-    });
+    if allow_raw_terminal {
+        candidates.push(OperatorTerminalCandidate {
+            mode: OperatorTerminalMode::RawTerminal,
+            payload: words.iter().flat_map(|word| word.to_le_bytes()).collect(),
+        });
+    }
     Ok(candidates
         .into_iter()
         .min_by_key(|candidate| (candidate.payload.len(), candidate.mode as u8)))
@@ -1356,8 +1474,11 @@ fn decode_operator_block(block: &OperatorBlock) -> Result<Vec<u8>, String> {
     if block.original_len as usize % 8 != 0 {
         return Err("operator block length must be divisible by 8".to_string());
     }
-    if block.key.len() != 8 {
-        return Err("strict operator K must be exactly 8 bytes".to_string());
+    if block.key_bits == 0 {
+        return Err("strict operator K bit length must be non-zero".to_string());
+    }
+    if block.key.len() != (block.key_bits as usize).div_ceil(8) {
+        return Err("strict operator K byte length is not canonical".to_string());
     }
     if block.steps == 0 {
         return Err("strict operator step count must be non-zero".to_string());
@@ -1375,9 +1496,8 @@ fn decode_operator_block(block: &OperatorBlock) -> Result<Vec<u8>, String> {
         word_count,
         block.original_len as usize,
     )?;
-    let key = u64::from_le_bytes(block.key.clone().try_into().unwrap());
     for _ in 0..block.steps {
-        apply_strict_operator_inverse_step(&mut words, key)?;
+        apply_strict_operator_inverse_step(&mut words, block.key_bits, &block.key)?;
     }
     Ok(words.into_iter().flat_map(u64::to_le_bytes).collect())
 }
@@ -1794,9 +1914,11 @@ fn append_serialized_block(out: &mut Vec<u8>, block: &BlockRecord) {
         BlockEncoding::Operator(operator) => {
             out.push(block.encoding.mode() as u8);
             push_u32(out, operator.original_len);
-            push_u16(out, operator.key.len() as u16);
+            push_u16(out, operator.key_bits);
             out.extend_from_slice(&operator.key);
             out.push(operator.steps);
+            push_u32(out, operator.breadcrumbs.len() as u32);
+            out.extend_from_slice(&operator.breadcrumbs);
             out.push(operator.terminal_mode as u8);
             push_u32(out, operator.terminal_payload.len() as u32);
             out.extend_from_slice(&operator.terminal_payload);
@@ -2017,12 +2139,15 @@ fn parse_archive(input: &[u8]) -> Result<Archive, String> {
                 })
             }
             4 => {
-                let key_len = read_u16(input, &mut cursor)? as usize;
+                let key_bits = read_u16(input, &mut cursor)?;
+                let key_len = (key_bits as usize).div_ceil(8);
                 let key = read_vec(input, &mut cursor, key_len)?;
-                if key.len() != 8 {
-                    return Err("strict operator K must be exactly 8 bytes".to_string());
+                if key_bits == 0 {
+                    return Err("strict operator K bit length must be non-zero".to_string());
                 }
                 let steps = read_u8(input, &mut cursor)?;
+                let breadcrumbs_len = read_u32(input, &mut cursor)? as usize;
+                let breadcrumbs = read_vec(input, &mut cursor, breadcrumbs_len)?;
                 let terminal_mode = match read_u8(input, &mut cursor)? {
                     0 => OperatorTerminalMode::UniformWord,
                     1 => OperatorTerminalMode::SmallPalette,
@@ -2040,8 +2165,10 @@ fn parse_archive(input: &[u8]) -> Result<Archive, String> {
                 )?;
                 BlockEncoding::Operator(OperatorBlock {
                     original_len,
+                    key_bits,
                     key,
                     steps,
+                    breadcrumbs,
                     terminal_mode,
                     terminal_payload,
                 })
@@ -2343,28 +2470,29 @@ mod compact_codec_tests {
             Some(block) => block,
             None => {
                 let signature = analyze_topology(&input).unwrap();
-                let key_u64 = compile_strict_operator_key(&signature, input.len() * 8).unwrap();
-                let key = key_u64.to_le_bytes().to_vec();
+                let key = compile_strict_operator_key(&signature, input.len() * 8).unwrap();
                 let mut words = input
                     .chunks_exact(8)
                     .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
                     .collect::<Vec<_>>();
-                apply_strict_operator_step(&mut words, key_u64).unwrap();
+                apply_strict_operator_step(&mut words, key.bit_len, &key.bytes).unwrap();
                 let payload = words
                     .iter()
                     .flat_map(|word| word.to_le_bytes())
                     .collect::<Vec<_>>();
                 OperatorBlock {
                     original_len: input.len() as u32,
-                    key,
+                    key_bits: key.bit_len,
+                    key: key.bytes,
                     steps: 1,
+                    breadcrumbs: Vec::new(),
                     terminal_mode: OperatorTerminalMode::RawTerminal,
                     terminal_payload: payload,
                 }
             }
         };
         assert_eq!(decode_operator_block(&block).unwrap(), input);
-        assert_eq!(block.key.len(), 8);
+        assert_eq!(block.key.len(), (block.key_bits as usize).div_ceil(8));
         assert!(block.steps > 0);
     }
 
@@ -2382,8 +2510,10 @@ mod compact_codec_tests {
                 window_index: 0,
                 encoding: BlockEncoding::Operator(OperatorBlock {
                     original_len: 64,
+                    key_bits: 57,
                     key: vec![0; 7],
                     steps: 1,
+                    breadcrumbs: Vec::new(),
                     terminal_mode: OperatorTerminalMode::RawTerminal,
                     terminal_payload: vec![0; 64],
                 }),
