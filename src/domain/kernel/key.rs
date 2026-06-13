@@ -1,131 +1,125 @@
 pub const MAGIC_KEY_BYTES: usize = 8;
 pub const MAX_SPECTRAL_PEAKS: usize = 3;
 pub const MAX_SPECTRAL_BITS: usize = 1 << 13;
-pub const MAX_OPERATOR_BITS: usize = 1 << 12;
 
 const SPECTRAL_INDEX_BITS: u64 = 13;
 const SPECTRAL_AMPLITUDE_BITS: u64 = 5;
-const OPERATOR_INDEX_BITS: u64 = 12;
 const TRAJECTORY_STEP_BITS: u64 = 6;
+const PACKED_CONSTANT_VERSION: u8 = 1;
+const PACKED_CONSTANT_FIXED_BYTES: usize = 26;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PipelineKind {
-    Walsh = 0,
-    Recurrence = 1,
+pub enum ConstantFamily {
+    PhaseXor = 0,
+    OddAffine = 1,
     Hybrid = 2,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum WindowClass {
-    MacroCoherent = 0,
-    Balanced = 1,
-    LocalTransient = 2,
-    ResidualDense = 3,
+pub enum RoutingKind {
+    Identity = 0,
+    RotateWords = 1,
+    ReverseWords = 2,
+    Butterfly = 3,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum BranchSchema {
-    LowEntropy = 0,
-    PeakParity = 1,
-    ShiftParity = 2,
-    Mixed = 3,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum StageOpcode {
-    HadamardAxis = 0,
-    PhaseProject = 1,
-    GF2Recurrence = 2,
-    OrbitFold = 3,
-    LanePermute = 4,
-    BranchGate = 5,
-    ParityProject = 6,
-    Halt = 7,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ProgramStage {
-    pub opcode: StageOpcode,
-    pub arg0: u8,
-    pub arg1: u8,
+pub struct ConstantLayout {
+    pub family: ConstantFamily,
+    pub routing: RoutingKind,
+    pub branch_rounds: u8,
+    pub rotate_left: u8,
+    pub rotate_right: u8,
+    pub gf2_shift: u8,
+    pub lane_rotate: u8,
+    pub pivot_seed: u8,
+    pub branch_stride: u8,
+    pub branch_span: u8,
+    pub phase_mask: u64,
+    pub odd_multiplier: u64,
+    pub affine_mask: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ProgramIR {
-    pub pipeline_kind: PipelineKind,
-    pub window_class: WindowClass,
-    pub branch_schema: BranchSchema,
-    pub stages: Vec<ProgramStage>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ProgramCode {
+pub struct PackedConstantK {
     bytes: Vec<u8>,
 }
 
-impl ProgramCode {
-    pub fn from_ir(program: &ProgramIR) -> Result<Self, String> {
-        validate_program_ir(program)?;
-        let mut bytes = Vec::with_capacity(2 + program.stages.len() * 3);
-        let header = (program.pipeline_kind as u8)
-            | ((program.window_class as u8) << 2)
-            | ((program.branch_schema as u8) << 4);
-        bytes.push(header);
-        bytes.push(program.stages.len() as u8);
-        for stage in &program.stages {
-            bytes.push(stage.opcode as u8);
-            bytes.push(stage.arg0);
-            bytes.push(stage.arg1);
+impl PackedConstantK {
+    pub fn from_layout(layout: &ConstantLayout) -> Result<Self, String> {
+        validate_constant_layout(layout)?;
+        let mut bytes = Vec::with_capacity(PACKED_CONSTANT_FIXED_BYTES + 8);
+        bytes.push(PACKED_CONSTANT_VERSION);
+        bytes.push((layout.family as u8) | ((layout.routing as u8) << 2));
+        bytes.push(layout.branch_rounds);
+        bytes.push(layout.rotate_left);
+        bytes.push(layout.rotate_right);
+        bytes.push(layout.gf2_shift);
+        bytes.push(layout.lane_rotate);
+        bytes.push(layout.pivot_seed);
+        bytes.push(layout.branch_stride);
+        bytes.push(layout.branch_span);
+        bytes.extend_from_slice(&layout.phase_mask.to_le_bytes());
+        bytes.extend_from_slice(&layout.odd_multiplier.to_le_bytes());
+        if let Some(mask) = layout.affine_mask {
+            bytes.extend_from_slice(&mask.to_le_bytes());
         }
         Ok(Self { bytes })
     }
 
     pub fn parse(bytes: &[u8]) -> Result<Self, String> {
-        if bytes.len() < 2 {
-            return Err("program code must contain a header and stage count".to_string());
-        }
-        let stage_count = usize::from(bytes[1]);
-        let expected = 2 + stage_count * 3;
-        if bytes.len() != expected {
-            return Err("program code length does not match its stage header".to_string());
-        }
         let code = Self {
             bytes: bytes.to_vec(),
         };
-        code.program()?;
+        code.layout()?;
         Ok(code)
     }
 
-    pub fn program(&self) -> Result<ProgramIR, String> {
-        let header = *self
-            .bytes
-            .first()
-            .ok_or_else(|| "program code is empty".to_string())?;
-        let stage_count = usize::from(
-            *self
-                .bytes
-                .get(1)
-                .ok_or_else(|| "program code is missing the stage count".to_string())?,
-        );
-        let pipeline_kind = parse_pipeline_kind(header & 0b11)?;
-        let window_class = parse_window_class((header >> 2) & 0b11)?;
-        let branch_schema = parse_branch_schema((header >> 4) & 0b11)?;
-        let mut stages = Vec::with_capacity(stage_count);
-        for chunk in self.bytes[2..].chunks_exact(3) {
-            stages.push(ProgramStage {
-                opcode: parse_stage_opcode(chunk[0])?,
-                arg0: chunk[1],
-                arg1: chunk[2],
-            });
+    pub fn layout(&self) -> Result<ConstantLayout, String> {
+        if self.bytes.len() < PACKED_CONSTANT_FIXED_BYTES {
+            return Err("packed constant is shorter than the fixed header".to_string());
         }
-        let program = ProgramIR {
-            pipeline_kind,
-            window_class,
-            branch_schema,
-            stages,
+        if self.bytes[0] != PACKED_CONSTANT_VERSION {
+            return Err("unsupported packed constant version".to_string());
+        }
+        let family = parse_constant_family(self.bytes[1] & 0b11)?;
+        let routing = parse_routing_kind((self.bytes[1] >> 2) & 0b11)?;
+        let affine_mask = match family {
+            ConstantFamily::PhaseXor => {
+                if self.bytes.len() != PACKED_CONSTANT_FIXED_BYTES {
+                    return Err(
+                        "phase-xor packed constant must not contain an affine payload".to_string(),
+                    );
+                }
+                None
+            }
+            ConstantFamily::OddAffine | ConstantFamily::Hybrid => {
+                if self.bytes.len() != PACKED_CONSTANT_FIXED_BYTES + 8 {
+                    return Err(
+                        "affine packed constant must contain exactly one affine payload"
+                            .to_string(),
+                    );
+                }
+                Some(parse_u64(&self.bytes[PACKED_CONSTANT_FIXED_BYTES..])?)
+            }
         };
-        validate_program_ir(&program)?;
-        Ok(program)
+        let layout = ConstantLayout {
+            family,
+            routing,
+            branch_rounds: self.bytes[2],
+            rotate_left: self.bytes[3],
+            rotate_right: self.bytes[4],
+            gf2_shift: self.bytes[5],
+            lane_rotate: self.bytes[6],
+            pivot_seed: self.bytes[7],
+            branch_stride: self.bytes[8],
+            branch_span: self.bytes[9],
+            phase_mask: parse_u64(&self.bytes[10..18])?,
+            odd_multiplier: parse_u64(&self.bytes[18..26])?,
+            affine_mask,
+        };
+        validate_constant_layout(&layout)?;
+        Ok(layout)
     }
 
     pub fn as_bytes(&self) -> &[u8] {
@@ -141,14 +135,33 @@ impl ProgramCode {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub enum MagicKeyKind {
-    Spectral,
-    Trajectory,
-    Operator,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SpectralPeakCode {
+    pub index: usize,
+    pub positive: bool,
+    pub amplitude: u8,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SpectralProgram {
+    pub bit_len: usize,
+    pub peaks: Vec<SpectralPeakCode>,
+    pub tie_bit: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct SpectralKey(u64);
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct TrajectoryKey(u64);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MagicKeyKind {
+    Spectral,
+    Trajectory,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MagicKey {
     raw: u64,
     kind: Option<MagicKeyKind>,
@@ -159,13 +172,6 @@ impl MagicKey {
         Ok(Self {
             raw: SpectralKey::from_program(program)?.raw(),
             kind: Some(MagicKeyKind::Spectral),
-        })
-    }
-
-    pub fn from_operator_blueprint(blueprint: &OperatorBlueprint) -> Result<Self, String> {
-        Ok(Self {
-            raw: OperatorKey::from_blueprint(blueprint)?.raw(),
-            kind: Some(MagicKeyKind::Operator),
         })
     }
 
@@ -183,22 +189,8 @@ impl MagicKey {
         })
     }
 
-    pub fn require_kind(mut self, expected: MagicKeyKind) -> Result<Self, String> {
-        self.kind = Some(expected);
-        Ok(self)
-    }
-
-    pub fn kind(self) -> Result<MagicKeyKind, String> {
-        self.kind
-            .ok_or_else(|| "magic key kind is unknown until the block mode is supplied".to_string())
-    }
-
     pub fn spectral_program(self) -> Result<SpectralProgram, String> {
         SpectralKey(self.raw).program()
-    }
-
-    pub fn operator_blueprint(self) -> Result<OperatorBlueprint, String> {
-        OperatorKey(self.raw).blueprint()
     }
 
     pub fn trajectory_steps(self) -> Result<u8, String> {
@@ -217,40 +209,6 @@ impl MagicKey {
         64
     }
 }
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct SpectralPeakCode {
-    pub index: usize,
-    pub positive: bool,
-    pub amplitude: u8,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SpectralProgram {
-    pub bit_len: usize,
-    pub peaks: Vec<SpectralPeakCode>,
-    pub tie_bit: bool,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct OperatorBlueprint {
-    pub peak_indices: [u16; 3],
-    pub peak_signs: [bool; 3],
-    pub primary_shift: u8,
-    pub round_count: u8,
-    pub derivative_density: u8,
-    pub popcnt_density: u8,
-    pub phase_parity: bool,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct SpectralKey(u64);
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct OperatorKey(u64);
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct TrajectoryKey(u64);
 
 impl SpectralKey {
     pub fn from_program(program: &SpectralProgram) -> Result<Self, String> {
@@ -310,64 +268,6 @@ impl SpectralKey {
     }
 }
 
-impl OperatorKey {
-    pub fn from_blueprint(blueprint: &OperatorBlueprint) -> Result<Self, String> {
-        validate_operator_blueprint(blueprint)?;
-        let mut raw = 0_u64;
-        for (slot, index) in blueprint.peak_indices.iter().enumerate() {
-            raw |= (u64::from(*index)) << (slot as u64 * OPERATOR_INDEX_BITS);
-            raw |= u64::from(blueprint.peak_signs[slot]) << (36 + slot as u64);
-        }
-        raw |= u64::from(blueprint.primary_shift - 1) << 39;
-        raw |= u64::from(blueprint.round_count - 1) << 44;
-        raw |= u64::from(blueprint.derivative_density) << 47;
-        raw |= u64::from(blueprint.popcnt_density) << 55;
-        raw |= u64::from(blueprint.phase_parity) << 63;
-        Ok(Self(raw))
-    }
-
-    pub fn blueprint(self) -> Result<OperatorBlueprint, String> {
-        let index_mask = (1_u64 << OPERATOR_INDEX_BITS) - 1;
-        let blueprint = OperatorBlueprint {
-            peak_indices: [
-                (self.0 & index_mask) as u16,
-                ((self.0 >> 12) & index_mask) as u16,
-                ((self.0 >> 24) & index_mask) as u16,
-            ],
-            peak_signs: [
-                ((self.0 >> 36) & 1) == 1,
-                ((self.0 >> 37) & 1) == 1,
-                ((self.0 >> 38) & 1) == 1,
-            ],
-            primary_shift: (((self.0 >> 39) & 0x1F) as u8) + 1,
-            round_count: (((self.0 >> 44) & 0x7) as u8) + 1,
-            derivative_density: ((self.0 >> 47) & 0xFF) as u8,
-            popcnt_density: ((self.0 >> 55) & 0xFF) as u8,
-            phase_parity: ((self.0 >> 63) & 1) == 1,
-        };
-        validate_operator_blueprint(&blueprint)?;
-        Ok(blueprint)
-    }
-
-    pub fn serialize(self) -> [u8; MAGIC_KEY_BYTES] {
-        self.0.to_le_bytes()
-    }
-
-    pub fn parse(bytes: &[u8]) -> Result<Self, String> {
-        let key = Self(parse_u64(bytes)?);
-        key.blueprint()?;
-        Ok(key)
-    }
-
-    pub fn raw(self) -> u64 {
-        self.0
-    }
-
-    pub fn encoded_bit_len(self) -> usize {
-        64
-    }
-}
-
 impl TrajectoryKey {
     pub fn from_payload(fingerprint: u64, steps: u8) -> Result<Self, String> {
         if !(1..64).contains(&steps) {
@@ -415,72 +315,58 @@ fn parse_u64(bytes: &[u8]) -> Result<u64, String> {
     Ok(u64::from_le_bytes(encoded))
 }
 
-fn parse_pipeline_kind(raw: u8) -> Result<PipelineKind, String> {
+fn parse_constant_family(raw: u8) -> Result<ConstantFamily, String> {
     match raw {
-        0 => Ok(PipelineKind::Walsh),
-        1 => Ok(PipelineKind::Recurrence),
-        2 => Ok(PipelineKind::Hybrid),
-        _ => Err("unsupported pipeline kind".to_string()),
+        0 => Ok(ConstantFamily::PhaseXor),
+        1 => Ok(ConstantFamily::OddAffine),
+        2 => Ok(ConstantFamily::Hybrid),
+        _ => Err("unsupported packed constant family".to_string()),
     }
 }
 
-fn parse_window_class(raw: u8) -> Result<WindowClass, String> {
+fn parse_routing_kind(raw: u8) -> Result<RoutingKind, String> {
     match raw {
-        0 => Ok(WindowClass::MacroCoherent),
-        1 => Ok(WindowClass::Balanced),
-        2 => Ok(WindowClass::LocalTransient),
-        3 => Ok(WindowClass::ResidualDense),
-        _ => Err("unsupported window class".to_string()),
+        0 => Ok(RoutingKind::Identity),
+        1 => Ok(RoutingKind::RotateWords),
+        2 => Ok(RoutingKind::ReverseWords),
+        3 => Ok(RoutingKind::Butterfly),
+        _ => Err("unsupported routing kind".to_string()),
     }
 }
 
-fn parse_branch_schema(raw: u8) -> Result<BranchSchema, String> {
-    match raw {
-        0 => Ok(BranchSchema::LowEntropy),
-        1 => Ok(BranchSchema::PeakParity),
-        2 => Ok(BranchSchema::ShiftParity),
-        3 => Ok(BranchSchema::Mixed),
-        _ => Err("unsupported branch schema".to_string()),
+fn validate_constant_layout(layout: &ConstantLayout) -> Result<(), String> {
+    if !(1..=16).contains(&layout.branch_rounds) {
+        return Err("branch round budget must be in 1..=16".to_string());
     }
-}
-
-fn parse_stage_opcode(raw: u8) -> Result<StageOpcode, String> {
-    match raw {
-        0 => Ok(StageOpcode::HadamardAxis),
-        1 => Ok(StageOpcode::PhaseProject),
-        2 => Ok(StageOpcode::GF2Recurrence),
-        3 => Ok(StageOpcode::OrbitFold),
-        4 => Ok(StageOpcode::LanePermute),
-        5 => Ok(StageOpcode::BranchGate),
-        6 => Ok(StageOpcode::ParityProject),
-        7 => Ok(StageOpcode::Halt),
-        _ => Err("unsupported stage opcode".to_string()),
+    if !(1..64).contains(&layout.rotate_left) {
+        return Err("left rotation must be in 1..63".to_string());
     }
-}
-
-fn validate_program_ir(program: &ProgramIR) -> Result<(), String> {
-    if program.stages.is_empty() {
-        return Err("program must contain at least one stage".to_string());
+    if !(1..64).contains(&layout.rotate_right) {
+        return Err("right rotation must be in 1..63".to_string());
     }
-    if program.stages.len() > usize::from(u8::MAX) {
-        return Err("program exceeds the serialisable stage budget".to_string());
+    if !(1..64).contains(&layout.gf2_shift) {
+        return Err("GF(2) shift must be in 1..63".to_string());
     }
-    if !matches!(
-        program.stages.last(),
-        Some(ProgramStage {
-            opcode: StageOpcode::Halt,
-            ..
-        })
-    ) {
-        return Err("program must terminate with Halt".to_string());
+    if layout.branch_stride == 0 {
+        return Err("branch stride must be non-zero".to_string());
     }
-    if program
-        .stages
-        .iter()
-        .take(program.stages.len().saturating_sub(1))
-        .any(|stage| stage.opcode == StageOpcode::Halt)
-    {
-        return Err("Halt may only appear as the last stage".to_string());
+    if layout.branch_span == 0 {
+        return Err("branch span must be non-zero".to_string());
+    }
+    if layout.odd_multiplier & 1 == 0 {
+        return Err("odd multiplier must stay odd".to_string());
+    }
+    match layout.family {
+        ConstantFamily::PhaseXor => {
+            if layout.affine_mask.is_some() {
+                return Err("phase-xor family must not carry an affine mask".to_string());
+            }
+        }
+        ConstantFamily::OddAffine | ConstantFamily::Hybrid => {
+            if layout.affine_mask.is_none() {
+                return Err("affine families must carry an affine mask".to_string());
+            }
+        }
     }
     Ok(())
 }
@@ -506,44 +392,67 @@ fn validate_spectral_program(program: &SpectralProgram) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_operator_blueprint(blueprint: &OperatorBlueprint) -> Result<(), String> {
-    for index in blueprint.peak_indices {
-        if usize::from(index) >= MAX_OPERATOR_BITS {
-            return Err("operator peak index is outside the 4096-bit block".to_string());
-        }
-    }
-    if !(1..=32).contains(&blueprint.primary_shift) {
-        return Err("operator primary shift must be in 1..=32".to_string());
-    }
-    if !(1..=8).contains(&blueprint.round_count) {
-        return Err("operator round count must be in 1..=8".to_string());
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn sample_operator_blueprint() -> OperatorBlueprint {
-        OperatorBlueprint {
-            peak_indices: [17, 511, 4095],
-            peak_signs: [true, false, true],
-            primary_shift: 5,
-            round_count: 3,
-            derivative_density: 0xAB,
-            popcnt_density: 0xCD,
-            phase_parity: true,
+    fn sample_layout() -> ConstantLayout {
+        ConstantLayout {
+            family: ConstantFamily::Hybrid,
+            routing: RoutingKind::Butterfly,
+            branch_rounds: 6,
+            rotate_left: 13,
+            rotate_right: 7,
+            gf2_shift: 9,
+            lane_rotate: 5,
+            pivot_seed: 11,
+            branch_stride: 3,
+            branch_span: 17,
+            phase_mask: 0x6996_0579_31EE_C0DE,
+            odd_multiplier: 0x9E37_79B9_7F4A_7C15,
+            affine_mask: Some(0xA5A5_5A5A_C3C3_3C3C),
         }
     }
 
     #[test]
-    fn operator_blueprint_roundtrips_through_typed_key() {
-        let bp = sample_operator_blueprint();
-        let key = OperatorKey::from_blueprint(&bp).unwrap();
-        assert_eq!(key.blueprint().unwrap(), bp);
-        assert_eq!(key.serialize().len(), 8);
-        assert_eq!(key.encoded_bit_len(), 64);
+    fn packed_constant_roundtrips_through_variable_length_encoding() {
+        let layout = sample_layout();
+        let packed = PackedConstantK::from_layout(&layout).unwrap();
+        assert!(packed.as_bytes().len() > 8);
+        assert_eq!(
+            PackedConstantK::parse(packed.as_bytes())
+                .unwrap()
+                .layout()
+                .unwrap(),
+            layout
+        );
+    }
+
+    #[test]
+    fn packed_constant_length_depends_on_family_payload() {
+        let hybrid = PackedConstantK::from_layout(&sample_layout()).unwrap();
+        let mut simple = sample_layout();
+        simple.family = ConstantFamily::PhaseXor;
+        simple.affine_mask = None;
+        let simple = PackedConstantK::from_layout(&simple).unwrap();
+        assert!(hybrid.as_bytes().len() > simple.as_bytes().len());
+    }
+
+    #[test]
+    fn malformed_packed_constant_is_rejected() {
+        assert!(PackedConstantK::parse(&[1, 0, 0]).is_err());
+        let mut encoded = PackedConstantK::from_layout(&sample_layout())
+            .unwrap()
+            .into_bytes();
+        encoded[0] = 9;
+        assert!(PackedConstantK::parse(&encoded).is_err());
+    }
+
+    #[test]
+    fn non_odd_multiplier_is_rejected() {
+        let mut layout = sample_layout();
+        layout.odd_multiplier = 4;
+        assert!(PackedConstantK::from_layout(&layout).is_err());
     }
 
     #[test]
@@ -582,9 +491,8 @@ mod tests {
     }
 
     #[test]
-    fn malformed_or_non_64_bit_k_is_rejected() {
+    fn malformed_or_non_64_bit_magic_k_is_rejected() {
         assert!(SpectralKey::parse(&[0_u8; 7]).is_err());
-        assert!(OperatorKey::parse(&[0_u8; 7]).is_err());
         assert!(TrajectoryKey::parse(&[0_u8; 7]).is_err());
     }
 
@@ -600,98 +508,5 @@ mod tests {
             tie_bit: false,
         };
         assert!(SpectralKey::from_program(&program).is_err());
-    }
-
-    #[test]
-    fn operator_index_above_4095_is_rejected() {
-        let mut bp = sample_operator_blueprint();
-        bp.peak_indices[0] = 4096;
-        assert!(OperatorKey::from_blueprint(&bp).is_err());
-    }
-
-    #[test]
-    fn variable_length_program_code_roundtrips_through_ir() {
-        let program = ProgramIR {
-            pipeline_kind: PipelineKind::Hybrid,
-            window_class: WindowClass::Balanced,
-            branch_schema: BranchSchema::Mixed,
-            stages: vec![
-                ProgramStage {
-                    opcode: StageOpcode::HadamardAxis,
-                    arg0: 17,
-                    arg1: 2,
-                },
-                ProgramStage {
-                    opcode: StageOpcode::BranchGate,
-                    arg0: 11,
-                    arg1: 0,
-                },
-                ProgramStage {
-                    opcode: StageOpcode::Halt,
-                    arg0: 0,
-                    arg1: 0,
-                },
-            ],
-        };
-        let code = ProgramCode::from_ir(&program).unwrap();
-        assert_eq!(
-            ProgramCode::parse(code.as_bytes())
-                .unwrap()
-                .program()
-                .unwrap(),
-            program
-        );
-        assert_eq!(code.encoded_bit_len(), code.as_bytes().len() * 8);
-    }
-
-    #[test]
-    fn changing_stage_order_changes_the_magic_program_code() {
-        let left = ProgramCode::from_ir(&ProgramIR {
-            pipeline_kind: PipelineKind::Hybrid,
-            window_class: WindowClass::Balanced,
-            branch_schema: BranchSchema::Mixed,
-            stages: vec![
-                ProgramStage {
-                    opcode: StageOpcode::HadamardAxis,
-                    arg0: 9,
-                    arg1: 1,
-                },
-                ProgramStage {
-                    opcode: StageOpcode::BranchGate,
-                    arg0: 7,
-                    arg1: 0,
-                },
-                ProgramStage {
-                    opcode: StageOpcode::Halt,
-                    arg0: 0,
-                    arg1: 0,
-                },
-            ],
-        })
-        .unwrap();
-        let right = ProgramCode::from_ir(&ProgramIR {
-            pipeline_kind: PipelineKind::Hybrid,
-            window_class: WindowClass::Balanced,
-            branch_schema: BranchSchema::Mixed,
-            stages: vec![
-                ProgramStage {
-                    opcode: StageOpcode::BranchGate,
-                    arg0: 7,
-                    arg1: 0,
-                },
-                ProgramStage {
-                    opcode: StageOpcode::HadamardAxis,
-                    arg0: 9,
-                    arg1: 1,
-                },
-                ProgramStage {
-                    opcode: StageOpcode::Halt,
-                    arg0: 0,
-                    arg1: 0,
-                },
-            ],
-        })
-        .unwrap();
-        assert_ne!(left.as_bytes(), right.as_bytes());
     }
 }

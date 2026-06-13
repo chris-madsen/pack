@@ -4,14 +4,14 @@ use crate::domain::bitstream::{
     bit_width_for_cardinality, ceil_div_u64, pack_indices, unpack_indices,
 };
 use crate::domain::kernel::budget::{BitBudget, CompressionPolicy};
-use crate::domain::kernel::key::{MagicKey, OperatorBlueprint, ProgramCode};
+use crate::domain::kernel::key::{MagicKey, PackedConstantK};
 use crate::domain::kernel::operator::{
     contract_block as contract_operator_block, expand_block as expand_operator_block,
     materialize_runtime,
 };
 use crate::domain::kernel::spectral::synthesise_spectral_bits;
 use crate::domain::kernel::topology::{
-    analyze_topology, block_fingerprint, compile_spectral_key, compile_topology_to_program,
+    analyze_topology, block_fingerprint, compile_spectral_key, compile_topology_to_constant,
     TopologySignature,
 };
 use crate::domain::kernel::trajectory::{
@@ -351,10 +351,10 @@ fn topology_score(signature: &TopologySignature) -> f64 {
     let peak_sum = signature
         .walsh_peaks
         .iter()
-        .map(|peak| peak.coefficient.abs())
+        .map(|peak| peak.coefficient.unsigned_abs() as f64)
         .sum::<f64>()
         .max(1e-12);
-    let prominence = signature.walsh_peaks[0].coefficient.abs() / peak_sum;
+    let prominence = signature.walsh_peaks[0].coefficient.unsigned_abs() as f64 / peak_sum;
     let derivative_density = signature.derivative.iter().filter(|bit| **bit == 1).count() as f64
         / signature.derivative.len().max(1) as f64;
     let shift_coherence = signature
@@ -363,11 +363,6 @@ fn topology_score(signature: &TopologySignature) -> f64 {
         .map(|score| score.matching_bits as f64 / signature.bit_len.max(1) as f64)
         .unwrap_or(0.0);
     prominence + shift_coherence - derivative_density * 0.35
-}
-
-#[cfg(test)]
-fn encode_block(block: &[u8]) -> Result<BlockEncoding, String> {
-    encode_block_with_profile(block, CompressionProfile::General)
 }
 
 fn encode_block_with_profile(
@@ -390,16 +385,25 @@ fn encode_block_with_profile(
         };
 
     let maybe_operator = try_encode_operator_block(block, cached_topology.as_ref())?;
-    let maybe_spectral = try_encode_spectral_block(block, cached_topology.as_ref())?;
-    let maybe_trajectory = try_encode_trajectory_block(block)?;
-    let (maybe_sparse_alphabet, maybe_alphabet) = if profile.policy().use_alphabet_fallback {
-        (
-            try_encode_sparse_alphabet_block(block, &analysis)?,
-            try_encode_alphabet_block(block, &analysis)?,
-        )
+    let maybe_spectral = if profile == CompressionProfile::General {
+        try_encode_spectral_block(block, cached_topology.as_ref())?
     } else {
-        (None, None)
+        None
     };
+    let maybe_trajectory = if profile == CompressionProfile::General {
+        try_encode_trajectory_block(block)?
+    } else {
+        None
+    };
+    let (maybe_sparse_alphabet, maybe_alphabet) =
+        if profile == CompressionProfile::General && profile.policy().use_alphabet_fallback {
+            (
+                try_encode_sparse_alphabet_block(block, &analysis)?,
+                try_encode_alphabet_block(block, &analysis)?,
+            )
+        } else {
+            (None, None)
+        };
     let mut best = raw;
 
     if let Some(candidate) = maybe_operator {
@@ -449,13 +453,6 @@ struct TerminalPalettePlan {
     terminal_indices: Vec<u8>,
     terminal_index_bits: u8,
     breadcrumbs: Vec<bool>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct TrajectoryScore {
-    encoded_bits: u64,
-    steps: u8,
-    terminal_count: usize,
 }
 
 #[cfg(test)]
@@ -746,10 +743,10 @@ fn try_encode_operator_block(
         Some(sig) => sig.clone(),
         None => analyze_topology(block)?,
     };
-    let program = compile_topology_to_program(&signature, block.len() * 8)?;
-    let runtime = materialize_runtime(&program, block.len() * 8)?;
+    let constant = compile_topology_to_constant(&signature, block.len() * 8)?;
+    let runtime = materialize_runtime(&constant, block.len() * 8)?;
     let (seed, branches) = contract_operator_block(&runtime, block)?;
-    let key = program.into_bytes();
+    let key = constant.into_bytes();
     let candidate = BlockEncoding::Operator(OperatorBlock {
         original_len: block.len() as u32,
         key: key.clone(),
@@ -822,228 +819,6 @@ fn build_terminal_palette_plan(
         terminal_indices,
         breadcrumbs,
     }))
-}
-
-fn estimate_plan_bits(plan: &TerminalPalettePlan) -> u64 {
-    plan.terminals.len() as u64 * 64
-        + plan.terminal_indices.len() as u64 * plan.terminal_index_bits as u64
-        + plan.breadcrumbs.len() as u64
-}
-
-fn operator_branch_positions(blueprint: &OperatorBlueprint, steps: u8) -> Vec<usize> {
-    (0..steps as usize)
-        .map(|round| {
-            let active_bits = 64 - round;
-            let seed = usize::from(blueprint.peak_indices[round % 3])
-                ^ (usize::from(blueprint.derivative_density) << 1)
-                ^ (usize::from(blueprint.popcnt_density) << 2)
-                ^ (usize::from(blueprint.primary_shift) * (round + 1))
-                ^ (usize::from(blueprint.round_count) * 11)
-                ^ (usize::from(blueprint.phase_parity) * 7)
-                ^ (usize::from(blueprint.peak_signs[round % 3]) * 13);
-            seed % active_bits
-        })
-        .collect()
-}
-
-fn remove_bit_at(value: u64, position: usize) -> u64 {
-    let low_mask = if position == 0 {
-        0
-    } else {
-        (1_u64 << position) - 1
-    };
-    let low = value & low_mask;
-    let high = if position >= 63 {
-        0
-    } else {
-        value >> (position + 1)
-    };
-    low | (high << position)
-}
-
-fn insert_bit_at(value: u64, position: usize, bit: bool) -> u64 {
-    let low_mask = if position == 0 {
-        0
-    } else {
-        (1_u64 << position) - 1
-    };
-    let low = value & low_mask;
-    let high = if position >= 63 { 0 } else { value >> position };
-    low | (u64::from(bit) << position)
-        | if position >= 63 {
-            0
-        } else {
-            high << (position + 1)
-        }
-}
-
-fn encode_operator_trajectory(
-    mut value: u64,
-    blueprint: &OperatorBlueprint,
-    steps: u8,
-) -> Result<ParityTrajectory, String> {
-    if !(1..64).contains(&steps) {
-        return Err("operator trajectory step count must be in 1..64".to_string());
-    }
-    let mut crumbs = Vec::with_capacity(steps as usize);
-    for position in operator_branch_positions(blueprint, steps) {
-        crumbs.push(((value >> position) & 1) == 1);
-        value = remove_bit_at(value, position);
-    }
-    Ok(ParityTrajectory {
-        terminal: value,
-        crumbs,
-    })
-}
-
-fn decode_operator_trajectory(
-    trajectory: &ParityTrajectory,
-    blueprint: &OperatorBlueprint,
-) -> Result<u64, String> {
-    let steps = trajectory.crumbs.len() as u8;
-    if !(1..64).contains(&steps) {
-        return Err("operator trajectory step count must be in 1..64".to_string());
-    }
-    let positions = operator_branch_positions(blueprint, steps);
-    let mut value = trajectory.terminal;
-    for (position, crumb) in positions
-        .into_iter()
-        .zip(trajectory.crumbs.iter().copied())
-        .rev()
-    {
-        value = insert_bit_at(value, position, crumb);
-    }
-    Ok(value)
-}
-
-fn build_operator_terminal_palette_plan(
-    words: &[u64],
-    blueprint: &OperatorBlueprint,
-    steps: u8,
-    max_terminals: usize,
-) -> Result<Option<TerminalPalettePlan>, String> {
-    if words.is_empty() || !(1..64).contains(&steps) || max_terminals == 0 {
-        return Ok(None);
-    }
-
-    let trajectories = words
-        .iter()
-        .map(|value| encode_operator_trajectory(*value, blueprint, steps))
-        .collect::<Result<Vec<_>, _>>()?;
-    let terminals = trajectories
-        .iter()
-        .map(|trajectory| trajectory.terminal)
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    if terminals.len() > max_terminals || terminals.len() > usize::from(u8::MAX) + 1 {
-        return Ok(None);
-    }
-
-    let index_by_terminal = terminals
-        .iter()
-        .copied()
-        .enumerate()
-        .map(|(index, terminal)| (terminal, index as u8))
-        .collect::<BTreeMap<_, _>>();
-    let terminal_indices = trajectories
-        .iter()
-        .map(|trajectory| {
-            index_by_terminal
-                .get(&trajectory.terminal)
-                .copied()
-                .ok_or_else(|| "operator terminal palette lookup failed".to_string())
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let breadcrumbs = trajectories
-        .into_iter()
-        .flat_map(|trajectory| trajectory.crumbs)
-        .collect::<Vec<_>>();
-    Ok(Some(TerminalPalettePlan {
-        terminal_index_bits: bit_width_for_cardinality(terminals.len()),
-        terminals,
-        terminal_indices,
-        breadcrumbs,
-    }))
-}
-
-fn best_grouped_operator_plan(
-    words: &[u64],
-    blueprint: &OperatorBlueprint,
-) -> Result<Option<(u8, TerminalPalettePlan)>, String> {
-    let mut best: Option<(u8, TerminalPalettePlan)> = None;
-    for steps in candidate_steps() {
-        let Some(plan) = build_operator_terminal_palette_plan(words, blueprint, steps, 256)? else {
-            continue;
-        };
-        let better = best
-            .as_ref()
-            .map(|(_, current)| estimate_plan_bits(&plan) < estimate_plan_bits(current))
-            .unwrap_or(true);
-        if better {
-            best = Some((steps, plan));
-        }
-    }
-    Ok(best)
-}
-
-fn grouped_operator_score(
-    words: &[u64],
-    blueprint: &OperatorBlueprint,
-) -> Result<Option<TrajectoryScore>, String> {
-    Ok(
-        best_grouped_operator_plan(words, blueprint)?.map(|(steps, plan)| TrajectoryScore {
-            encoded_bits: estimate_plan_bits(&plan),
-            steps,
-            terminal_count: plan.terminals.len(),
-        }),
-    )
-}
-
-fn best_grouped_trajectory_plan(
-    words: &[u64],
-) -> Result<Option<(u8, TerminalPalettePlan)>, String> {
-    let mut best: Option<(u8, TerminalPalettePlan)> = None;
-    for steps in candidate_steps() {
-        let Some(plan) = build_terminal_palette_plan(words, steps, 256)? else {
-            continue;
-        };
-        let better = best
-            .as_ref()
-            .map(|(_, current)| estimate_plan_bits(&plan) < estimate_plan_bits(current))
-            .unwrap_or(true);
-        if better {
-            best = Some((steps, plan));
-        }
-    }
-    Ok(best)
-}
-
-fn grouped_trajectory_score(words: &[u64]) -> Result<Option<TrajectoryScore>, String> {
-    Ok(
-        best_grouped_trajectory_plan(words)?.map(|(steps, plan)| TrajectoryScore {
-            encoded_bits: estimate_plan_bits(&plan),
-            steps,
-            terminal_count: plan.terminals.len(),
-        }),
-    )
-}
-
-fn is_better_trajectory_score(
-    candidate: Option<TrajectoryScore>,
-    incumbent: Option<TrajectoryScore>,
-) -> bool {
-    match (candidate, incumbent) {
-        (Some(left), Some(right)) => {
-            left.encoded_bits < right.encoded_bits
-                || (left.encoded_bits == right.encoded_bits
-                    && (left.terminal_count < right.terminal_count
-                        || (left.terminal_count == right.terminal_count
-                            && left.steps < right.steps)))
-        }
-        (Some(_), None) => true,
-        _ => false,
-    }
 }
 
 fn decode_alphabet_block(block: &AlphabetBlock) -> Result<Vec<u8>, String> {
@@ -1173,8 +948,8 @@ fn decode_operator_block(block: &OperatorBlock) -> Result<Vec<u8>, String> {
     if block.original_len as usize % 8 != 0 {
         return Err("operator block length must be divisible by 8".to_string());
     }
-    let program = ProgramCode::parse(&block.key)?;
-    let runtime = materialize_runtime(&program, block.original_len as usize * 8)?;
+    let constant = PackedConstantK::parse(&block.key)?;
+    let runtime = materialize_runtime(&constant, block.original_len as usize * 8)?;
     expand_operator_block(&runtime, &block.seed, &block.branches)
 }
 
@@ -1705,12 +1480,12 @@ fn parse_archive(input: &[u8]) -> Result<Archive, String> {
             4 => {
                 let key_len = read_u16(input, &mut cursor)? as usize;
                 let key = read_vec(input, &mut cursor, key_len)?;
-                let program = ProgramCode::parse(&key)?;
+                let constant = PackedConstantK::parse(&key)?;
                 let seed_len = read_u32(input, &mut cursor)? as usize;
                 let seed = read_vec(input, &mut cursor, seed_len)?;
                 let branch_len = read_u32(input, &mut cursor)? as usize;
                 let branches = read_vec(input, &mut cursor, branch_len)?;
-                let runtime = materialize_runtime(&program, original_len as usize * 8)?;
+                let runtime = materialize_runtime(&constant, original_len as usize * 8)?;
                 expand_operator_block(&runtime, &seed, &branches)?;
                 BlockEncoding::Operator(OperatorBlock {
                     original_len,
@@ -1914,7 +1689,7 @@ mod compact_codec_tests {
         BlockEncoding, BlockRecord, OperatorBlock, PassWindowBand, RawBlock, MAGIC_MULTI,
     };
     use crate::domain::kernel::operator::{contract_block, expand_block, materialize_runtime};
-    use crate::domain::kernel::topology::{analyze_topology, compile_topology_to_program};
+    use crate::domain::kernel::topology::{analyze_topology, compile_topology_to_constant};
 
     #[test]
     fn roundtrip_ascii_and_binary_data() {
@@ -1982,10 +1757,10 @@ mod compact_codec_tests {
     }
 
     #[test]
-    fn operator_program_is_variable_length_and_roundtrips_seed_and_branch_log() {
+    fn operator_constant_is_variable_length_and_roundtrips_seed_and_branch_log() {
         let input = [0x3C_u8; 512];
         let signature = analyze_topology(&input).unwrap();
-        let code = compile_topology_to_program(&signature, input.len() * 8).unwrap();
+        let code = compile_topology_to_constant(&signature, input.len() * 8).unwrap();
         assert!(code.as_bytes().len() > 8);
         let runtime = materialize_runtime(&code, input.len() * 8).unwrap();
         let (seed, branches) = contract_block(&runtime, &input).unwrap();
@@ -1997,7 +1772,7 @@ mod compact_codec_tests {
     fn operator_block_wire_format_roundtrips_through_decoder() {
         let input = [0x5A_u8; 512];
         let signature = analyze_topology(&input).unwrap();
-        let code = compile_topology_to_program(&signature, input.len() * 8).unwrap();
+        let code = compile_topology_to_constant(&signature, input.len() * 8).unwrap();
         let runtime = materialize_runtime(&code, input.len() * 8).unwrap();
         let (seed, branches) = contract_block(&runtime, &input).unwrap();
         let block = OperatorBlock {
