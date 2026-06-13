@@ -3,16 +3,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::domain::bitstream::{
     bit_width_for_cardinality, ceil_div_u64, pack_indices, unpack_indices,
 };
-use crate::domain::kernel::base::{
-    generate_base_from_root, standard_base, GeneratedBase, RootSeed,
-};
 use crate::domain::kernel::budget::{BitBudget, CompressionPolicy};
 use crate::domain::kernel::key::{MagicKey, MagicKeyKind, OperatorBlueprint};
 use crate::domain::kernel::operator::{
-    apply_binary_u_k, BinaryOperatorKey, IndexMix, PhaseKey, SpectralOperatorKey,
-};
-use crate::domain::kernel::reversible::{
-    feistel_forward, feistel_inverse, FeistelKey, FeistelRoundKey,
+    apply_binary_u_k, strongest_binary_word_peaks, BinaryOperatorKey, BinaryWordPeak, IndexMix,
+    PhaseKey, SpectralOperatorKey,
 };
 use crate::domain::kernel::spectral::synthesise_spectral_bits;
 use crate::domain::kernel::topology::{
@@ -599,10 +594,10 @@ fn try_encode_operator_block(block: &[u8]) -> Result<Option<BlockEncoding>, Stri
         Ok(None) | Err(_) => return Ok(None),
     };
     let base_key_bytes = base_key.serialize();
-    let (operator, generated, feistel, _) = parse_operator_runtime_key(&base_key_bytes)?;
+    let operator = parse_operator_runtime_key(&base_key_bytes)?;
     let transformed = words
         .iter()
-        .map(|word| apply_operator_word_u_k_with_runtime(*word, &operator, &generated, &feistel))
+        .map(|word| apply_operator_word_u_k_with_runtime(*word, &operator))
         .collect::<Result<Vec<_>, _>>()?;
     let direct_score = grouped_trajectory_score(&words)?;
     let transformed_score = grouped_trajectory_score(&transformed)?;
@@ -670,8 +665,8 @@ fn try_encode_operator_block(block: &[u8]) -> Result<Option<BlockEncoding>, Stri
     Ok(best)
 }
 
-fn candidate_steps() -> [u8; 10] {
-    [2_u8, 4, 8, 12, 16, 24, 32, 40, 48, 56]
+fn candidate_steps() -> std::ops::Range<u8> {
+    1_u8..64
 }
 
 fn build_terminal_palette_plan(
@@ -921,7 +916,7 @@ fn decode_operator_block(block: &OperatorBlock) -> Result<Vec<u8>, String> {
         word_count,
     )?;
     let crumbs = unpack_bools(&block.breadcrumbs, total_steps)?;
-    let (operator, generated, feistel, _) = parse_operator_runtime_key(&block.key)?;
+    let operator = parse_operator_runtime_key(&block.key)?;
     let mut out = Vec::with_capacity(block.original_len as usize);
     for (terminal_index, word_crumbs) in terminal_indices
         .into_iter()
@@ -935,8 +930,7 @@ fn decode_operator_block(block: &OperatorBlock) -> Result<Vec<u8>, String> {
             terminal,
             crumbs: word_crumbs.to_vec(),
         })?;
-        let word =
-            invert_operator_word_u_k_with_runtime(transformed, &operator, &generated, &feistel)?;
+        let word = invert_operator_word_u_k_with_runtime(transformed, &operator)?;
         out.extend_from_slice(&word.to_le_bytes());
     }
     Ok(out)
@@ -958,7 +952,7 @@ fn select_operator_codec_key_from_family(
 ) -> Result<Option<MagicKey>, String> {
     let signature = analyze_topology(block)?;
     let original_score = grouped_trajectory_score(words)?;
-    let candidates = operator_candidate_family(&signature)?;
+    let candidates = operator_candidate_family(&signature, words)?;
     let mut best = None;
     let mut best_key = None;
     for candidate in candidates {
@@ -977,10 +971,10 @@ fn select_operator_codec_key_from_family(
 }
 
 fn score_operator_key(words: &[u64], key: MagicKey) -> Result<Option<TrajectoryScore>, String> {
-    let (operator, generated, feistel, _) = parse_operator_runtime_key(&key.serialize())?;
+    let operator = parse_operator_runtime_key(&key.serialize())?;
     let transformed = words
         .iter()
-        .map(|word| apply_operator_word_u_k_with_runtime(*word, &operator, &generated, &feistel))
+        .map(|word| apply_operator_word_u_k_with_runtime(*word, &operator))
         .collect::<Result<Vec<_>, _>>()?;
     grouped_trajectory_score(&transformed)
 }
@@ -992,42 +986,46 @@ fn is_better_operator_score(
     is_better_trajectory_score(candidate, incumbent)
 }
 
-fn operator_candidate_family(signature: &TopologySignature) -> Result<Vec<MagicKey>, String> {
+fn operator_candidate_family(
+    signature: &TopologySignature,
+    words: &[u64],
+) -> Result<Vec<MagicKey>, String> {
     let base = compile_topology_to_key(signature)?;
     let base_blueprint = base.operator_blueprint()?;
-    let fallback_peak = signature.walsh_peaks.first();
     let fallback_shift = signature.shift_scores.first();
-    let peak_pairs = [
-        (signature.walsh_peaks.first(), signature.walsh_peaks.get(1)),
-        (signature.walsh_peaks.first(), signature.walsh_peaks.get(2)),
-        (signature.walsh_peaks.get(1), signature.walsh_peaks.first()),
-        (signature.walsh_peaks.get(2), signature.walsh_peaks.first()),
-    ];
-    let variants = peak_pairs
-        .into_iter()
-        .enumerate()
-        .filter_map(|(index, (dominant, secondary))| {
-            let dominant = dominant.or(fallback_peak)?;
-            let secondary = secondary.or(fallback_peak).unwrap_or(dominant);
-            let shift = signature
+    let binary_peaks = strongest_binary_word_peaks(words, 4)?;
+    let mut variants = Vec::new();
+    for (dominant_slot, dominant) in binary_peaks.iter().enumerate() {
+        for (secondary_slot, secondary) in binary_peaks.iter().enumerate() {
+            if secondary_slot == dominant_slot {
+                continue;
+            }
+            let Some(shift) = signature
                 .shift_scores
-                .get(index % signature.shift_scores.len())
-                .or(fallback_shift)?;
-            Some(OperatorBlueprint {
-                dominant_index: dominant.index as u16,
-                dominant_positive: !dominant.coefficient.is_sign_negative(),
-                primary_shift: shift.shift as u8,
-                shift_match: (((shift.matching_bits * 0x1FF) + signature.bit_len / 2)
-                    / signature.bit_len) as u16,
+                .get((dominant_slot + secondary_slot) % signature.shift_scores.len())
+                .or(fallback_shift)
+            else {
+                continue;
+            };
+            let tertiary = binary_peaks
+                .get((secondary_slot + 1) % binary_peaks.len())
+                .unwrap_or(secondary);
+            let primary_shift = encoded_primary_shift(dominant, secondary, shift.shift as u8);
+            variants.push(OperatorBlueprint {
+                dominant_index: dominant.bit as u16,
+                dominant_positive: dominant.positive,
+                primary_shift,
+                shift_match: quantize_ratio(dominant.bias as usize, words.len(), 9) as u16,
                 derivative_density: base_blueprint.derivative_density,
                 popcnt_density: base_blueprint.popcnt_density,
-                secondary_delta: ((secondary.index ^ dominant.index) & 0x1F) as u8,
-                tertiary_delta: (((signature.fingerprint >> (index * 5)) as usize ^ dominant.index)
+                secondary_delta: encode_operator_delta(dominant.bit, secondary.bit),
+                tertiary_delta: encode_operator_delta(dominant.bit, tertiary.bit),
+                fingerprint_bias: ((signature.fingerprint
+                    >> (((dominant_slot + secondary_slot) % 8) * 5))
                     & 0x1F) as u8,
-                fingerprint_bias: ((signature.fingerprint >> (index * 3)) & 0x1F) as u8,
-            })
-        })
-        .collect::<Vec<_>>();
+            });
+        }
+    }
     Ok(variants
         .into_iter()
         .chain(std::iter::once(base_blueprint))
@@ -1037,9 +1035,28 @@ fn operator_candidate_family(signature: &TopologySignature) -> Result<Vec<MagicK
         .collect())
 }
 
-fn parse_operator_runtime_key(
-    key_bytes: &[u8],
-) -> Result<(SpectralOperatorKey, GeneratedBase, FeistelKey, u64), String> {
+fn encoded_primary_shift(
+    dominant: &BinaryWordPeak,
+    secondary: &BinaryWordPeak,
+    fallback_shift: u8,
+) -> u8 {
+    let delta = ((secondary.bit as i16 - dominant.bit as i16).rem_euclid(64) as u8) % 31;
+    delta.max(1).max(fallback_shift.min(31))
+}
+
+fn encode_operator_delta(from: u8, to: u8) -> u8 {
+    ((to as i16 - from as i16 - 1).rem_euclid(32)) as u8
+}
+
+fn quantize_ratio(numerator: usize, denominator: usize, bits: u8) -> u64 {
+    if denominator == 0 {
+        return 0;
+    }
+    let max = (1_u64 << bits) - 1;
+    ((numerator as u128 * max as u128 + (denominator as u128 / 2)) / denominator as u128) as u64
+}
+
+fn parse_operator_runtime_key(key_bytes: &[u8]) -> Result<SpectralOperatorKey, String> {
     let key = MagicKey::parse(key_bytes)?;
     let blueprint = key
         .require_kind(MagicKeyKind::Operator)?
@@ -1077,13 +1094,7 @@ fn parse_operator_runtime_key(
         ^ (u64::from(blueprint.fingerprint_bias) << 56)
         ^ (u64::from(blueprint.shift_match) << 17))
         | 1;
-    let generated = generate_base_from_root(
-        &standard_base(1)?,
-        RootSeed {
-            value: key.payload(),
-        },
-    )?;
-    let operator = SpectralOperatorKey {
+    Ok(SpectralOperatorKey {
         mix: IndexMix {
             xor_mask: (mask
                 ^ repeat_byte(blueprint.fingerprint_bias)
@@ -1102,72 +1113,39 @@ fn parse_operator_runtime_key(
             shift_right,
             odd_multiplier,
         },
-    };
-    let feistel = FeistelKey {
-        rounds: vec![
-            FeistelRoundKey {
-                shift_left,
-                shift_right,
-                rotate: ((u16::from(blueprint.primary_shift) + u16::from(blueprint.shift_match))
-                    % 32) as u8,
-                odd_multiplier: odd_multiplier as u32 | 1,
-                add: seed as u32,
-                mask: mask as u32,
-            },
-            FeistelRoundKey {
-                shift_left: shift_right,
-                shift_right: shift_left,
-                rotate: ((u16::from(blueprint.secondary_delta)
-                    + u16::from(blueprint.tertiary_delta)
-                    + u16::from(blueprint.fingerprint_bias))
-                    % 31
-                    + 1) as u8,
-                odd_multiplier: (odd_multiplier >> 32) as u32 | 1,
-                add: (seed >> 32) as u32,
-                mask: (mask >> 32) as u32,
-            },
-        ],
-    };
-    feistel.validate()?;
-    Ok((operator, generated, feistel, seed))
+    })
 }
 
 #[cfg(test)]
 fn apply_operator_word_u_k(value: u64, key_bytes: &[u8]) -> Result<u64, String> {
-    let (operator, generated, feistel, _) = parse_operator_runtime_key(key_bytes)?;
-    apply_operator_word_u_k_with_runtime(value, &operator, &generated, &feistel)
+    let operator = parse_operator_runtime_key(key_bytes)?;
+    apply_operator_word_u_k_with_runtime(value, &operator)
 }
 
 fn apply_operator_word_u_k_with_runtime(
     value: u64,
     operator: &SpectralOperatorKey,
-    generated: &GeneratedBase,
-    feistel: &FeistelKey,
 ) -> Result<u64, String> {
-    let forward = feistel_forward(generated.apply_forward(value)?, feistel)?;
     let phase = operator.phase.seed
         ^ operator.phase.mask.rotate_left(17)
         ^ operator.phase.odd_multiplier.rotate_right(11)
         ^ (operator.phase.shift_left as u64)
         ^ ((operator.phase.shift_right as u64) << 8);
-    let reflected = apply_binary_u_k(
-        forward,
+    Ok(apply_binary_u_k(
+        value,
         BinaryOperatorKey {
             xor_mask: operator.mix.xor_mask as u64,
             rotate: operator.mix.rotate,
             phase_mask: phase,
         },
-    );
-    generated.apply_inverse(feistel_inverse(reflected, feistel)?)
+    ))
 }
 
 fn invert_operator_word_u_k_with_runtime(
     value: u64,
     operator: &SpectralOperatorKey,
-    generated: &GeneratedBase,
-    feistel: &FeistelKey,
 ) -> Result<u64, String> {
-    apply_operator_word_u_k_with_runtime(value, operator, generated, feistel)
+    apply_operator_word_u_k_with_runtime(value, operator)
 }
 
 fn repeat_byte(byte: u8) -> u64 {
@@ -1923,6 +1901,7 @@ mod compact_codec_tests {
         BlockEncoding, MagicKey, OperatorBlock, RawBlock, SpectralBlock, DEFAULT_BLOCK_SIZE_BYTES,
         MAGIC_MULTI,
     };
+    use crate::domain::kernel::operator::strongest_binary_word_peaks;
     use crate::domain::kernel::topology::{analyze_topology, compile_spectral_key};
 
     fn walsh_basis_bytes(bit_len: usize, basis_index: usize) -> Vec<u8> {
@@ -2096,6 +2075,38 @@ mod compact_codec_tests {
     }
 
     #[test]
+    fn operator_codec_runtime_is_direct_binary_u_k() {
+        let source = [0x3C_u8; 64];
+        let key = build_operator_codec_key(&source).unwrap();
+        let runtime = super::parse_operator_runtime_key(&key.serialize()).unwrap();
+        let phase = runtime.phase.seed
+            ^ runtime.phase.mask.rotate_left(17)
+            ^ runtime.phase.odd_multiplier.rotate_right(11)
+            ^ (runtime.phase.shift_left as u64)
+            ^ ((runtime.phase.shift_right as u64) << 8);
+        let expected = apply_binary_u_k(
+            0x0123_4567_89AB_CDEF,
+            BinaryOperatorKey {
+                xor_mask: runtime.mix.xor_mask as u64,
+                rotate: runtime.mix.rotate,
+                phase_mask: phase,
+            },
+        );
+        assert_eq!(
+            super::apply_operator_word_u_k(0x0123_4567_89AB_CDEF, &key.serialize()).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn parity_step_search_covers_the_full_runtime_domain() {
+        assert_eq!(
+            super::candidate_steps().collect::<Vec<_>>(),
+            (1_u8..64).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn operator_is_never_accepted_without_strictly_shorter_parity_trajectory() {
         for seed in 0_u64..64 {
             let input = (0..64)
@@ -2147,6 +2158,32 @@ mod compact_codec_tests {
                     || found_score == seed_score
             );
         }
+    }
+
+    #[test]
+    fn operator_family_contains_a_blueprint_built_from_binary_runtime_peaks() {
+        let words = [
+            0x0000_0000_0000_0000_u64,
+            0x0000_0000_0000_0000_u64,
+            0xFFFF_FFFF_FFFF_FFFF_u64,
+            0xFFFF_FFFF_FFFF_FFFF_u64,
+            0x0000_0000_0000_0000_u64,
+            0xFFFF_FFFF_FFFF_FFFF_u64,
+            0x0000_0000_0000_0000_u64,
+            0xFFFF_FFFF_FFFF_FFFF_u64,
+        ];
+        let input = words
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect::<Vec<_>>();
+        let signature = analyze_topology(&input).unwrap();
+        let binary_peak = strongest_binary_word_peaks(&words, 1).unwrap()[0];
+        let family = super::operator_candidate_family(&signature, &words).unwrap();
+        assert!(family.iter().any(|key| {
+            let blueprint = key.operator_blueprint().unwrap();
+            blueprint.dominant_index == binary_peak.bit as u16
+                && blueprint.dominant_positive == binary_peak.positive
+        }));
     }
 
     #[test]

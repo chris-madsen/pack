@@ -43,6 +43,13 @@ pub struct BinaryOperatorKey {
     pub phase_mask: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BinaryWordPeak {
+    pub bit: u8,
+    pub positive: bool,
+    pub bias: u16,
+}
+
 pub fn apply_phase_reflection(values: &mut [f64], key: &PhaseKey) -> Result<(), String> {
     key.validate()?;
     for (index, value) in values.iter_mut().enumerate() {
@@ -98,6 +105,43 @@ pub fn apply_binary_u_k(value: u64, key: BinaryOperatorKey) -> u64 {
     let spectral = binary_hadamard_forward(mixed);
     let reflected = spectral ^ key.phase_mask;
     binary_hadamard_inverse(reflected).rotate_right(rotate) ^ key.xor_mask
+}
+
+pub fn strongest_binary_word_peaks(
+    words: &[u64],
+    count: usize,
+) -> Result<Vec<BinaryWordPeak>, String> {
+    if words.is_empty() {
+        return Err("binary word peak analysis requires at least one word".to_string());
+    }
+
+    let transformed = words
+        .iter()
+        .copied()
+        .map(binary_hadamard_forward)
+        .collect::<Vec<_>>();
+    let mut peaks = (0..64_u8)
+        .map(|bit| {
+            let ones = transformed
+                .iter()
+                .filter(|word| ((*word >> bit) & 1) == 1)
+                .count();
+            let zeros = transformed.len() - ones;
+            BinaryWordPeak {
+                bit,
+                positive: ones >= zeros,
+                bias: ones.abs_diff(zeros) as u16,
+            }
+        })
+        .collect::<Vec<_>>();
+    peaks.sort_by(|left, right| {
+        right
+            .bias
+            .cmp(&left.bias)
+            .then_with(|| left.bit.cmp(&right.bit))
+    });
+    peaks.truncate(count.min(peaks.len()));
+    Ok(peaks)
 }
 
 fn binary_hadamard_forward(mut value: u64) -> u64 {
@@ -163,7 +207,7 @@ fn validate_vector(values: &[f64]) -> Result<(), String> {
 mod tests {
     use super::{
         apply_binary_u_k, apply_fk, apply_fk_inverse, apply_phase_reflection, apply_u_k,
-        BinaryOperatorKey, IndexMix, PhaseKey, SpectralOperatorKey,
+        strongest_binary_word_peaks, BinaryOperatorKey, IndexMix, PhaseKey, SpectralOperatorKey,
     };
 
     fn phase_key() -> PhaseKey {
@@ -270,5 +314,13 @@ mod tests {
         for value in [0, 1, u64::MAX, 0xDEAD_BEEF_CAFE_BABE] {
             assert_eq!(apply_binary_u_k(apply_binary_u_k(value, key), key), value);
         }
+    }
+
+    #[test]
+    fn binary_word_peaks_are_computed_in_the_same_space_as_the_runtime_operator() {
+        let words = [0_u64, 0_u64, u64::MAX, u64::MAX];
+        let peaks = strongest_binary_word_peaks(&words, 4).unwrap();
+        assert!(!peaks.is_empty());
+        assert!(peaks[0].bias > 0);
     }
 }
