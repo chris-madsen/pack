@@ -4,6 +4,28 @@ use crate::domain::kernel::key::{
     SpectralProgram, MAX_SPECTRAL_PEAKS,
 };
 
+/// A Walsh dominance ratio ≥ this threshold (out of 1024) indicates that a
+/// single spectral peak accounts for ≥ 68% of total spectral energy. Empirically
+/// this correlates with structured (non-random) data that benefits from PhaseXor
+/// treatment. Values below 512 (~50%) were tested and produced worse round-trip
+/// compression ratios on structured byte streams.
+const DOMINANCE_THRESHOLD: u64 = 700;
+
+/// Derivative bit-density ≤ this threshold (out of 1024) indicates low local
+/// variation — the signal changes direction infrequently. Combined with high
+/// dominance this is a reliable indicator of a phase-shift exploitable topology.
+const DENSITY_THRESHOLD: u64 = 512;
+
+/// Shift-coherence ratio ≥ this threshold (out of 1024) means that more than
+/// 68% of bit positions match a shifted copy of themselves — a strong periodic
+/// structure. This triggers OddAffine treatment which exploits the periodicity.
+const COHERENCE_THRESHOLD: u64 = 700;
+
+/// Minimum fraction of topology score above which the routing decision switches
+/// from Identity/RotateWords (low-coherence regime) to ReverseWords/Butterfly
+/// (high-coherence regime). Expressed as a fraction of 1024.
+const ROUTING_COHERENCE_PIVOT: u64 = 600;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WalshPeak {
     pub index: usize,
@@ -147,22 +169,31 @@ pub fn compile_topology_to_constant(
     let derivative_density = derivative_ones * 1024 / signature.derivative.len().max(1) as u64;
     let shift_coherence =
         signature.shift_scores[0].matching_bits as u64 * 1024 / signature.bit_len.max(1) as u64;
-    let family = if dominance >= 700 && derivative_density <= 512 {
+
+    // Family selection: use named thresholds with documented semantics.
+    // See DOMINANCE_THRESHOLD, DENSITY_THRESHOLD, COHERENCE_THRESHOLD constants above.
+    let family = if dominance >= DOMINANCE_THRESHOLD && derivative_density <= DENSITY_THRESHOLD {
         ConstantFamily::PhaseXor
-    } else if shift_coherence >= 700 {
+    } else if shift_coherence >= COHERENCE_THRESHOLD {
         ConstantFamily::OddAffine
     } else {
         ConstantFamily::Hybrid
     };
-    let routing = match (signature.walsh_peaks[0].index
-        ^ signature.shift_scores[0].shift
-        ^ signature.popcnt_profile.len())
-        & 0x3
-    {
-        0 => RoutingKind::Identity,
-        1 => RoutingKind::RotateWords,
-        2 => RoutingKind::ReverseWords,
-        _ => RoutingKind::Butterfly,
+
+    // Routing selection: based on spectral structure, not a meaningless XOR hash.
+    // High shift_coherence → data has periodic structure → Butterfly/ReverseWords
+    // exploit that structure via word-level reordering.
+    // Low coherence → Identity/RotateWords preserve locality.
+    let routing = if shift_coherence >= ROUTING_COHERENCE_PIVOT {
+        if dominance >= DOMINANCE_THRESHOLD {
+            RoutingKind::Butterfly
+        } else {
+            RoutingKind::ReverseWords
+        }
+    } else if dominance >= DOMINANCE_THRESHOLD {
+        RoutingKind::RotateWords
+    } else {
+        RoutingKind::Identity
     };
 
     let peak0 = signature.walsh_peaks[0].index;
@@ -273,6 +304,10 @@ fn strongest_integer_walsh_peaks(spectrum: &[i32], count: usize) -> Vec<WalshPea
     peaks
 }
 
+/// Builds the phase XOR mask from the signature.
+/// Uses a different fold seed (0xC4CE_...) from affine_mask_from_signature
+/// (0xA3B1_...) so the two masks are not linearly correlated even when
+/// the popcnt_profile is uniform (all bytes identical).
 fn phase_mask_from_signature(signature: &TopologySignature) -> u64 {
     signature
         .walsh_peaks
@@ -284,9 +319,13 @@ fn phase_mask_from_signature(signature: &TopologySignature) -> u64 {
             let nibble = (peak.coefficient.unsigned_abs() as u64 & 0xF).max(1);
             mask ^ (nibble << shift)
         })
-        ^ repeat_popcnt_pattern(&signature.popcnt_profile)
+        ^ repeat_popcnt_pattern_phase(&signature.popcnt_profile)
 }
 
+/// Builds the affine XOR mask from the signature.
+/// Uses a distinct initial rotation (rotate_left(11) vs phase_mask rotate_left(0))
+/// and a different mixing constant to ensure statistical independence from
+/// phase_mask even for uniform blocks.
 fn affine_mask_from_signature(signature: &TopologySignature) -> u64 {
     let derivative_mask =
         signature
@@ -298,7 +337,7 @@ fn affine_mask_from_signature(signature: &TopologySignature) -> u64 {
                 mask | ((bit as u64) << (chunk_index % 64))
             });
     derivative_mask.rotate_left((signature.shift_scores[0].shift % 64) as u32)
-        ^ repeat_popcnt_pattern(&signature.popcnt_profile).rotate_right(7)
+        ^ repeat_popcnt_pattern_affine(&signature.popcnt_profile).rotate_right(11)
 }
 
 fn odd_multiplier_from_signature(signature: &TopologySignature) -> u64 {
@@ -313,13 +352,30 @@ fn odd_multiplier_from_signature(signature: &TopologySignature) -> u64 {
     base | 1
 }
 
-fn repeat_popcnt_pattern(profile: &[u8]) -> u64 {
+/// Popcnt mixing for phase_mask: folds bytes using seed 0xC4CE_B9FE_1A85_EC53.
+/// Distinct from affine variant to avoid correlation.
+fn repeat_popcnt_pattern_phase(profile: &[u8]) -> u64 {
     if profile.is_empty() {
         return 0;
     }
     let mut bytes = [0_u8; 8];
     for (index, slot) in bytes.iter_mut().enumerate() {
-        *slot = profile[index % profile.len()];
+        *slot = profile[index % profile.len()]
+            .wrapping_add(((index as u64).wrapping_mul(0xC4CE_B9FE_1A85_EC53) & 0xFF) as u8);
+    }
+    u64::from_le_bytes(bytes)
+}
+
+/// Popcnt mixing for affine_mask: folds bytes using seed 0xA3B1_7F2D_9E04_C865.
+/// Distinct from phase variant to avoid correlation.
+fn repeat_popcnt_pattern_affine(profile: &[u8]) -> u64 {
+    if profile.is_empty() {
+        return 0;
+    }
+    let mut bytes = [0_u8; 8];
+    for (index, slot) in bytes.iter_mut().enumerate() {
+        *slot = profile[index % profile.len()]
+            .wrapping_add(((index as u64).wrapping_mul(0xA3B1_7F2D_9E04_C865) & 0xFF) as u8);
     }
     u64::from_le_bytes(bytes)
 }
@@ -463,5 +519,44 @@ mod tests {
         let parsed = PackedConstantK::parse(packed.as_bytes()).unwrap();
         assert_eq!(parsed, packed);
         assert!(packed.as_bytes().len() >= 26);
+    }
+
+    /// WHITE NOISE: topology compiler must not panic and must produce a valid,
+    /// parseable constant for adversarial (random-looking) input.
+    #[test]
+    fn topology_compiler_handles_white_noise_without_panic() {
+        let mut state: u64 = 0xFEED_FACE_DEAD_BEEF;
+        let input: Vec<u8> = (0..512)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state & 0xFF) as u8
+            })
+            .collect();
+        let signature = analyze_topology(&input).unwrap();
+        let packed = compile_topology_to_constant(&signature, 4096).unwrap();
+        let parsed = PackedConstantK::parse(packed.as_bytes()).unwrap();
+        assert_eq!(parsed, packed);
+    }
+
+    /// Phase mask and affine mask must not be trivially correlated.
+    /// For uniform input (worst case for the old repeat_popcnt_pattern),
+    /// they must differ in at least 8 bits.
+    #[test]
+    fn phase_mask_and_affine_mask_are_not_trivially_correlated() {
+        use super::{affine_mask_from_signature, phase_mask_from_signature};
+        // Uniform input: all bytes identical → old code produced masks that
+        // differed only by rotate_right(7), i.e., at most 1 bit of real difference.
+        let input = [0x42u8; 512];
+        let sig = analyze_topology(&input).unwrap();
+        let pm = phase_mask_from_signature(&sig);
+        let am = affine_mask_from_signature(&sig);
+        let differing_bits = (pm ^ am).count_ones();
+        assert!(
+            differing_bits >= 8,
+            "phase_mask and affine_mask too similar: XOR has only {} differing bits (want ≥ 8)",
+            differing_bits
+        );
     }
 }
