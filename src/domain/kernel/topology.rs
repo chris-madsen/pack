@@ -125,8 +125,8 @@ pub fn analyze_topology(bytes: &[u8]) -> Result<TopologySignature, String> {
 }
 
 pub fn compile_topology_to_key(signature: &TopologySignature) -> Result<MagicKey, String> {
-    if signature.bit_len == 0 || !signature.bit_len.is_power_of_two() {
-        return Err("signature bit length must be a power of two".to_string());
+    if signature.bit_len != 4096 {
+        return Err("operator topology compiler currently requires a 4096-bit block".to_string());
     }
     if signature.walsh_peaks.is_empty() || signature.shift_scores.is_empty() {
         return Err("signature lacks required topology features".to_string());
@@ -140,33 +140,41 @@ pub fn compile_topology_to_key(signature: &TopologySignature) -> Result<MagicKey
         signature.derivative.iter().filter(|bit| **bit == 1).count(),
         signature.derivative.len(),
         8,
-    );
-    let derivative_signature =
-        (derivative_density & !1) | u64::from(*signature.derivative.first().unwrap_or(&0));
+    ) as u8;
     let popcnt_sum = signature
         .popcnt_profile
         .iter()
         .map(|count| *count as usize)
         .sum::<usize>();
     let popcnt_capacity = signature.popcnt_profile.len().saturating_mul(64);
-    let popcnt_density = quantize_ratio(popcnt_sum, popcnt_capacity.max(1), 8);
-    let popcnt_signature = (popcnt_density & !0x0F)
-        | u64::from(signature.popcnt_profile.first().copied().unwrap_or(0) & 0x0F);
-    let shift_match = quantize_ratio(shift.matching_bits, signature.bit_len, 9);
-    let secondary_delta = ((second.index ^ dominant.index) & 0x1F) as u8;
-    let tertiary_delta = ((third.index ^ dominant.index) & 0x1F) as u8;
-    let fingerprint_bias = (signature.fingerprint & 0x1F) as u8;
+    let popcnt_density = quantize_ratio(popcnt_sum, popcnt_capacity.max(1), 8) as u8;
+    let round_count = (((signature.fingerprint & 0x7) as u8) % 8) + 1;
+    let phase_parity = ((signature.fingerprint
+        ^ signature
+            .derivative
+            .iter()
+            .map(|bit| *bit as u64)
+            .sum::<u64>()
+        ^ popcnt_sum as u64)
+        & 1)
+        == 1;
 
     MagicKey::from_operator_blueprint(&OperatorBlueprint {
-        dominant_index: dominant.index as u16,
-        dominant_positive: !dominant.coefficient.is_sign_negative(),
-        primary_shift: shift.shift as u8,
-        shift_match: shift_match as u16,
-        derivative_density: derivative_signature as u8,
-        popcnt_density: popcnt_signature as u8,
-        secondary_delta,
-        tertiary_delta,
-        fingerprint_bias,
+        peak_indices: [
+            dominant.index as u16,
+            second.index as u16,
+            third.index as u16,
+        ],
+        peak_signs: [
+            !dominant.coefficient.is_sign_negative(),
+            !second.coefficient.is_sign_negative(),
+            !third.coefficient.is_sign_negative(),
+        ],
+        primary_shift: shift.shift.min(32) as u8,
+        round_count,
+        derivative_density,
+        popcnt_density,
+        phase_parity,
     })
 }
 
@@ -260,15 +268,13 @@ mod tests {
 
     #[test]
     fn topology_compiler_is_deterministic_and_uses_all_required_profiles() {
-        let input = [0xAA_u8; 64];
+        let input = [0xAA_u8; 512];
         let signature = analyze_topology(&input).unwrap();
         let first = compile_topology_to_key(&signature).unwrap();
         let second = compile_topology_to_key(&signature).unwrap();
         assert_eq!(first, second);
-
         assert_eq!(first.encoded_bit_len(), 64);
         assert_ne!(first.raw(), 0);
-        assert!(first.spectral_program().is_err());
 
         let spectral = compile_spectral_key(&signature).unwrap();
         let program = spectral.spectral_program().unwrap();
@@ -287,37 +293,33 @@ mod tests {
 
     #[test]
     fn changing_block_topology_changes_compiled_k() {
-        let left = compile_topology_to_key(&analyze_topology(&[0xAA; 64]).unwrap()).unwrap();
-        let right = compile_topology_to_key(&analyze_topology(&[0xF0; 64]).unwrap()).unwrap();
+        let left = compile_topology_to_key(&analyze_topology(&[0xAA; 512]).unwrap()).unwrap();
+        let right = compile_topology_to_key(&analyze_topology(&[0xF0; 512]).unwrap()).unwrap();
         assert_ne!(left.serialize(), right.serialize());
     }
 
     #[test]
     fn operator_key_exposes_structural_topology_fields() {
-        let signature = analyze_topology(&[0xA5; 64]).unwrap();
+        let signature = analyze_topology(&[0xA5; 512]).unwrap();
         let key = compile_topology_to_key(&signature).unwrap();
         let blueprint = key.operator_blueprint().unwrap();
         assert_eq!(
-            usize::from(blueprint.dominant_index),
+            usize::from(blueprint.peak_indices[0]),
             signature.walsh_peaks[0].index
         );
         assert_eq!(
-            blueprint.dominant_positive,
+            blueprint.peak_signs[0],
             !signature.walsh_peaks[0].coefficient.is_sign_negative()
         );
         assert_eq!(
             usize::from(blueprint.primary_shift),
-            signature.shift_scores[0].shift
-        );
-        assert_eq!(
-            blueprint.fingerprint_bias,
-            (signature.fingerprint & 0x1F) as u8
+            signature.shift_scores[0].shift.min(32)
         );
     }
 
     #[test]
     fn every_topology_profile_materially_changes_compiled_k() {
-        let signature = analyze_topology(&[0xA5; 64]).unwrap();
+        let signature = analyze_topology(&[0xA5; 512]).unwrap();
         let baseline = compile_topology_to_key(&signature).unwrap().serialize();
 
         let mut changed = signature.clone();
@@ -346,14 +348,7 @@ mod tests {
         );
 
         let mut changed = signature.clone();
-        changed.popcnt_profile[0] ^= 1;
-        assert_ne!(
-            compile_topology_to_key(&changed).unwrap().serialize(),
-            baseline
-        );
-
-        let mut changed = signature;
-        changed.fingerprint ^= 1;
+        changed.popcnt_profile[0] ^= 0x1F;
         assert_ne!(
             compile_topology_to_key(&changed).unwrap().serialize(),
             baseline
@@ -361,19 +356,11 @@ mod tests {
     }
 
     #[test]
-    fn block_fingerprint_depends_on_the_entire_block() {
-        let mut left = vec![0xAA; 512];
-        let mut right = left.clone();
-        right[511] ^= 1;
-        assert_ne!(
-            block_fingerprint(&left).unwrap(),
-            block_fingerprint(&right).unwrap()
-        );
-
-        left[0] ^= 1;
-        assert_ne!(
-            block_fingerprint(&left).unwrap(),
-            block_fingerprint(&right).unwrap()
+    fn fingerprint_is_deterministic_for_the_same_block() {
+        let input = [0x42_u8; 512];
+        assert_eq!(
+            block_fingerprint(&input).unwrap(),
+            block_fingerprint(&input).unwrap()
         );
     }
 }

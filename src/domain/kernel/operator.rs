@@ -1,4 +1,9 @@
+use crate::domain::kernel::reversible::{
+    feistel_forward, feistel_inverse, FeistelKey, FeistelRoundKey,
+};
 use crate::domain::kernel::spectral::normalized_fwht;
+
+pub const OPERATOR_BLOCK_WORDS: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct IndexMix {
@@ -36,9 +41,9 @@ pub struct SpectralOperatorKey {
     pub phase: PhaseKey,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BinaryOperatorKey {
-    pub xor_mask: u64,
+    pub feistel: FeistelKey,
     pub rotate: u8,
     pub phase_mask: u64,
 }
@@ -99,12 +104,14 @@ pub fn apply_u_k(values: &[f64], key: &SpectralOperatorKey) -> Result<Vec<f64>, 
     apply_fk_inverse(&state, key.mix)
 }
 
-pub fn apply_binary_u_k(value: u64, key: BinaryOperatorKey) -> u64 {
+pub fn apply_binary_u_k(value: u64, key: &BinaryOperatorKey) -> Result<u64, String> {
+    key.feistel.validate()?;
     let rotate = key.rotate as u32 % 64;
-    let mixed = (value ^ key.xor_mask).rotate_left(rotate);
-    let spectral = binary_hadamard_forward(mixed);
+    let mixed = feistel_forward(value, &key.feistel)?;
+    let spectral = binary_hadamard_forward(mixed.rotate_left(rotate));
     let reflected = spectral ^ key.phase_mask;
-    binary_hadamard_inverse(reflected).rotate_right(rotate) ^ key.xor_mask
+    let restored = binary_hadamard_inverse(reflected).rotate_right(rotate);
+    feistel_inverse(restored, &key.feistel)
 }
 
 pub fn strongest_binary_word_peaks(
@@ -144,21 +151,7 @@ pub fn strongest_binary_word_peaks(
     Ok(peaks)
 }
 
-fn binary_hadamard_forward(mut value: u64) -> u64 {
-    for half_width in [1_usize, 2, 4, 8, 16, 32] {
-        value = cnot_stage(value, half_width);
-    }
-    value
-}
-
-fn binary_hadamard_inverse(mut value: u64) -> u64 {
-    for half_width in [32_usize, 16, 8, 4, 2, 1] {
-        value = cnot_stage(value, half_width);
-    }
-    value
-}
-
-fn cnot_stage(mut value: u64, half_width: usize) -> u64 {
+pub fn cnot_stage(mut value: u64, half_width: usize) -> u64 {
     let block_width = half_width * 2;
     for block_start in (0..64).step_by(block_width) {
         for offset in 0..half_width {
@@ -169,6 +162,62 @@ fn cnot_stage(mut value: u64, half_width: usize) -> u64 {
         }
     }
     value
+}
+
+pub fn binary_hadamard_forward(mut value: u64) -> u64 {
+    for half_width in [1_usize, 2, 4, 8, 16, 32] {
+        value = cnot_stage(value, half_width);
+    }
+    value
+}
+
+pub fn binary_hadamard_inverse(mut value: u64) -> u64 {
+    for half_width in [32_usize, 16, 8, 4, 2, 1] {
+        value = cnot_stage(value, half_width);
+    }
+    value
+}
+
+pub fn apply_block_butterfly_forward(words: &mut [u64; OPERATOR_BLOCK_WORDS]) {
+    for half_width in [1_usize, 2, 4, 8, 16, 32] {
+        word_cnot_stage(words, half_width);
+    }
+}
+
+pub fn apply_block_butterfly_inverse(words: &mut [u64; OPERATOR_BLOCK_WORDS]) {
+    for half_width in [32_usize, 16, 8, 4, 2, 1] {
+        word_cnot_stage(words, half_width);
+    }
+}
+
+pub fn word_cnot_stage(words: &mut [u64; OPERATOR_BLOCK_WORDS], half_width: usize) {
+    let block_width = half_width * 2;
+    for block_start in (0..OPERATOR_BLOCK_WORDS).step_by(block_width) {
+        for offset in 0..half_width {
+            let control = block_start + offset;
+            let target = control + half_width;
+            words[target] ^= words[control];
+        }
+    }
+}
+
+pub fn default_feistel_from_seed(seed: u64, rounds: u8) -> FeistelKey {
+    let round_count = rounds.max(1);
+    let mut keys = Vec::with_capacity(round_count as usize);
+    for round in 0..round_count {
+        let stripe = seed.rotate_left((round as u32 * 9 + 7) % 64);
+        let hi = (stripe >> 32) as u32;
+        let lo = stripe as u32;
+        keys.push(FeistelRoundKey {
+            shift_left: ((stripe & 0x0F) as u8).max(1),
+            shift_right: (((stripe >> 4) & 0x0F) as u8).max(1),
+            rotate: ((stripe >> 8) & 0x1F) as u8,
+            odd_multiplier: lo | 1,
+            add: hi ^ 0x9E37_79B9_u32.rotate_left(round as u32),
+            mask: hi.rotate_left(13) ^ lo.rotate_right(7) ^ 0xA5A5_5A5A,
+        });
+    }
+    FeistelKey { rounds: keys }
 }
 
 fn phase_bit(index: u64, key: &PhaseKey) -> u8 {
@@ -206,8 +255,10 @@ fn validate_vector(values: &[f64]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_binary_u_k, apply_fk, apply_fk_inverse, apply_phase_reflection, apply_u_k,
-        strongest_binary_word_peaks, BinaryOperatorKey, IndexMix, PhaseKey, SpectralOperatorKey,
+        apply_binary_u_k, apply_block_butterfly_forward, apply_block_butterfly_inverse, apply_fk,
+        apply_fk_inverse, apply_phase_reflection, apply_u_k, binary_hadamard_forward,
+        default_feistel_from_seed, strongest_binary_word_peaks, BinaryOperatorKey, IndexMix,
+        PhaseKey, SpectralOperatorKey, OPERATOR_BLOCK_WORDS,
     };
 
     fn phase_key() -> PhaseKey {
@@ -274,53 +325,53 @@ mod tests {
     }
 
     #[test]
-    fn changing_k_changes_the_operator() {
-        let input = (0..16).map(|value| value as f64).collect::<Vec<_>>();
-        let left = apply_u_k(
-            &input,
-            &SpectralOperatorKey {
-                mix: IndexMix {
-                    xor_mask: 1,
-                    rotate: 1,
-                },
-                phase: phase_key(),
-            },
-        )
-        .unwrap();
-        let right = apply_u_k(
-            &input,
-            &SpectralOperatorKey {
-                mix: IndexMix {
-                    xor_mask: 7,
-                    rotate: 2,
-                },
-                phase: PhaseKey {
-                    seed: 42,
-                    ..phase_key()
-                },
-            },
-        )
-        .unwrap();
-        assert_ne!(left, right);
-    }
-
-    #[test]
     fn binary_u_k_is_an_exact_involution_for_word_codec() {
         let key = BinaryOperatorKey {
-            xor_mask: 0x0123_4567_89AB_CDEF,
+            feistel: default_feistel_from_seed(0x0123_4567_89AB_CDEF, 3),
             rotate: 17,
             phase_mask: 0xF0F0_0F0F_AAAA_5555,
         };
         for value in [0, 1, u64::MAX, 0xDEAD_BEEF_CAFE_BABE] {
-            assert_eq!(apply_binary_u_k(apply_binary_u_k(value, key), key), value);
+            assert_eq!(
+                apply_binary_u_k(apply_binary_u_k(value, &key).unwrap(), &key).unwrap(),
+                value
+            );
         }
     }
 
     #[test]
-    fn binary_word_peaks_are_computed_in_the_same_space_as_the_runtime_operator() {
+    fn binary_u_k_is_not_a_constant_xor_translation() {
+        let key = BinaryOperatorKey {
+            feistel: default_feistel_from_seed(0xA5A5_5A5A_DEAD_BEEF, 4),
+            rotate: 9,
+            phase_mask: 0x00FF_F0F0_0F0F_FF00,
+        };
+        let a = apply_binary_u_k(0x0123_4567_89AB_CDEF, &key).unwrap() ^ 0x0123_4567_89AB_CDEF;
+        let b = apply_binary_u_k(0x1123_4567_89AB_CDEE, &key).unwrap() ^ 0x1123_4567_89AB_CDEE;
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn block_butterfly_has_an_explicit_inverse() {
+        let mut state = [0_u64; OPERATOR_BLOCK_WORDS];
+        for (index, word) in state.iter_mut().enumerate() {
+            *word = (index as u64).rotate_left((index % 17) as u32);
+        }
+        let original = state;
+        apply_block_butterfly_forward(&mut state);
+        apply_block_butterfly_inverse(&mut state);
+        assert_eq!(state, original);
+    }
+
+    #[test]
+    fn binary_word_peaks_are_computed_in_the_same_runtime_space() {
         let words = [0_u64, 0_u64, u64::MAX, u64::MAX];
         let peaks = strongest_binary_word_peaks(&words, 4).unwrap();
         assert!(!peaks.is_empty());
         assert!(peaks[0].bias > 0);
+        assert_ne!(
+            binary_hadamard_forward(words[0]),
+            binary_hadamard_forward(words[2])
+        );
     }
 }

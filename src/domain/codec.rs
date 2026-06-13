@@ -5,10 +5,7 @@ use crate::domain::bitstream::{
 };
 use crate::domain::kernel::budget::{BitBudget, CompressionPolicy};
 use crate::domain::kernel::key::{MagicKey, MagicKeyKind, OperatorBlueprint};
-use crate::domain::kernel::operator::{
-    apply_binary_u_k, strongest_binary_word_peaks, BinaryOperatorKey, BinaryWordPeak, IndexMix,
-    PhaseKey, SpectralOperatorKey,
-};
+use crate::domain::kernel::operator::{apply_binary_u_k, BinaryOperatorKey};
 use crate::domain::kernel::spectral::synthesise_spectral_bits;
 use crate::domain::kernel::topology::{
     analyze_topology, block_fingerprint, compile_spectral_key, compile_topology_to_key,
@@ -31,6 +28,36 @@ const RECURSIVE_HEADER_BYTES: usize = 29;
 const LAYER_SUMMARY_BYTES: usize = 20;
 pub const DEFAULT_BLOCK_SIZE_BYTES: usize = 512;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CompressionProfile {
+    General,
+    StrictGeneratorOnly,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ProfilePolicy {
+    use_alphabet_fallback: bool,
+    first_layer_max_ratio: Option<f64>,
+    recursive_min_gain_fraction: f64,
+}
+
+impl CompressionProfile {
+    fn policy(self) -> ProfilePolicy {
+        match self {
+            Self::General => ProfilePolicy {
+                use_alphabet_fallback: true,
+                first_layer_max_ratio: None,
+                recursive_min_gain_fraction: 0.0,
+            },
+            Self::StrictGeneratorOnly => ProfilePolicy {
+                use_alphabet_fallback: false,
+                first_layer_max_ratio: Some(0.1),
+                recursive_min_gain_fraction: 0.1,
+            },
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompressionOutcome {
     pub archive: Vec<u8>,
@@ -38,21 +65,52 @@ pub struct CompressionOutcome {
 }
 
 pub fn compress_bytes(input: &[u8], block_size_hint: Option<usize>) -> Result<Vec<u8>, String> {
-    compress_bytes_with_outcome(input, block_size_hint).map(|outcome| outcome.archive)
+    compress_bytes_with_profile(input, block_size_hint, CompressionProfile::General)
+        .map(|outcome| outcome.archive)
 }
 
 pub fn compress_bytes_with_outcome(
     input: &[u8],
     block_size_hint: Option<usize>,
 ) -> Result<CompressionOutcome, String> {
+    compress_bytes_with_profile(input, block_size_hint, CompressionProfile::General)
+}
+
+pub fn compress_bytes_generator_only_strict(
+    input: &[u8],
+    block_size_hint: Option<usize>,
+) -> Result<CompressionOutcome, String> {
+    compress_bytes_with_profile(
+        input,
+        block_size_hint,
+        CompressionProfile::StrictGeneratorOnly,
+    )
+}
+
+fn compress_bytes_with_profile(
+    input: &[u8],
+    block_size_hint: Option<usize>,
+    profile: CompressionProfile,
+) -> Result<CompressionOutcome, String> {
+    let policy = profile.policy();
     let mut current = input.to_vec();
     let mut layers = Vec::new();
     let mut best_archive = serialize_recursive_archive(input.len() as u64, &layers, &current);
 
-    for _ in 0..MAX_LAYERS {
+    let mut first_layer_attempted = false;
+    for layer_index in 0..MAX_LAYERS {
         let candidates = candidate_block_sizes(&current, block_size_hint);
-        let best = choose_best_single_layer(&current, &candidates)?;
+        let best = choose_best_single_layer(&current, &candidates, profile)?;
+        if layer_index == 0 {
+            first_layer_attempted = true;
+        }
         if best.output.len() >= current.len() {
+            if layer_index == 0 && policy.first_layer_max_ratio.is_some() {
+                return Err(
+                    "InsufficientFirstLayerGain: no acceptable first compressed layer was produced"
+                        .to_string(),
+                );
+            }
             break;
         }
 
@@ -66,13 +124,44 @@ pub fn compress_bytes_with_outcome(
         let tentative_archive =
             serialize_recursive_archive(input.len() as u64, &tentative_layers, &best.output);
 
-        if tentative_archive.len() >= best_archive.len() {
+        if layer_index == 0 {
+            if let Some(max_ratio) = policy.first_layer_max_ratio {
+                if input.is_empty()
+                    || tentative_archive.len() as f64 / input.len() as f64 > max_ratio
+                {
+                    return Err(format!(
+                        "InsufficientFirstLayerGain: required at least {:.1}x, got {:.4}x",
+                        1.0 / max_ratio,
+                        if tentative_archive.is_empty() {
+                            f64::INFINITY
+                        } else {
+                            input.len() as f64 / tentative_archive.len() as f64
+                        }
+                    ));
+                }
+            }
+        }
+
+        let required_next_len = ((best_archive.len() as f64)
+            * (1.0 - policy.recursive_min_gain_fraction))
+            .floor() as usize;
+        if tentative_archive.len() >= best_archive.len()
+            || (policy.recursive_min_gain_fraction > 0.0
+                && tentative_archive.len() > required_next_len)
+        {
             break;
         }
 
         layers = tentative_layers;
         current = best.output;
         best_archive = tentative_archive;
+    }
+
+    if first_layer_attempted && layers.is_empty() && policy.first_layer_max_ratio.is_some() {
+        return Err(
+            "InsufficientFirstLayerGain: first layer did not satisfy the strict contract"
+                .to_string(),
+        );
     }
 
     Ok(CompressionOutcome {
@@ -126,7 +215,15 @@ pub fn analyze_block(block: &[u8]) -> BlockAnalysis {
     }
 }
 
+#[cfg(test)]
 fn encode_block(block: &[u8]) -> Result<BlockEncoding, String> {
+    encode_block_with_profile(block, CompressionProfile::General)
+}
+
+fn encode_block_with_profile(
+    block: &[u8],
+    profile: CompressionProfile,
+) -> Result<BlockEncoding, String> {
     let analysis = analyze_block(block);
     let raw = BlockEncoding::Raw(RawBlock {
         original_len: block.len() as u32,
@@ -145,8 +242,14 @@ fn encode_block(block: &[u8]) -> Result<BlockEncoding, String> {
     let maybe_operator = try_encode_operator_block(block, cached_topology.as_ref())?;
     let maybe_spectral = try_encode_spectral_block(block, cached_topology.as_ref())?;
     let maybe_trajectory = try_encode_trajectory_block(block)?;
-    let maybe_sparse_alphabet = try_encode_sparse_alphabet_block(block, &analysis)?;
-    let maybe_alphabet = try_encode_alphabet_block(block, &analysis)?;
+    let (maybe_sparse_alphabet, maybe_alphabet) = if profile.policy().use_alphabet_fallback {
+        (
+            try_encode_sparse_alphabet_block(block, &analysis)?,
+            try_encode_alphabet_block(block, &analysis)?,
+        )
+    } else {
+        (None, None)
+    };
     let mut best = raw;
 
     if let Some(candidate) = maybe_operator {
@@ -208,11 +311,12 @@ struct TrajectoryScore {
 fn choose_best_single_layer(
     input: &[u8],
     candidates: &[usize],
+    profile: CompressionProfile,
 ) -> Result<SingleLayerCandidate, String> {
     let mut best: Option<SingleLayerCandidate> = None;
 
     for &candidate in candidates {
-        let output = compress_single_layer_bytes(input, candidate)?;
+        let output = compress_single_layer_bytes_with_profile(input, candidate, profile)?;
         let item = SingleLayerCandidate {
             block_size: candidate,
             output,
@@ -232,89 +336,23 @@ fn choose_best_single_layer(
 }
 
 fn candidate_block_sizes(input: &[u8], block_size_hint: Option<usize>) -> Vec<usize> {
-    let input_len = input.len();
-    let baseline = match block_size_hint {
-        Some(value) if value > 0 => vec![
-            value / 4,
-            value / 2,
-            value,
-            value.saturating_mul(2),
-            value.saturating_mul(4),
-        ],
-        _ => {
-            let (window_min, window_max) = adaptive_window_bounds(input);
-            let mut values = powers_of_two_between(window_min, window_max);
-            values.extend([64, 128, 256, 512, 1024, 2048, 4096, 8192]);
-            values
-        }
-    };
-
-    let upper = input_len.max(64);
-    let mut unique = BTreeSet::new();
-    for candidate in baseline {
-        if candidate > 0 {
-            unique.insert(candidate.min(upper));
-        }
-    }
-    unique.insert(upper);
-    unique.into_iter().collect()
+    let resolved = block_size_hint
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_BLOCK_SIZE_BYTES)
+        .min(input.len().max(1));
+    vec![resolved]
 }
 
-fn adaptive_window_bounds(input: &[u8]) -> (usize, usize) {
-    let upper = input.len().next_power_of_two().min(8192).max(64);
-    let score = spectral_prominence_score(input).unwrap_or(1.0);
-    if score >= 12.0 {
-        (512.min(upper), upper.max(512))
-    } else if score >= 6.0 {
-        (256.min(upper), upper.min(4096).max(256))
-    } else {
-        (64.min(upper), upper.min(1024).max(64))
-    }
-}
-
-fn powers_of_two_between(min_value: usize, max_value: usize) -> Vec<usize> {
-    let mut values = Vec::new();
-    let mut current = min_value.max(1).next_power_of_two();
-    let ceiling = max_value.max(current);
-    while current <= ceiling {
-        values.push(current);
-        match current.checked_mul(2) {
-            Some(next) => current = next,
-            None => break,
-        }
-    }
-    values
-}
-
-fn spectral_prominence_score(input: &[u8]) -> Option<f64> {
-    let probe_len = largest_power_of_two_probe(input.len())?;
-    let probe = input.get(..probe_len)?;
-    let signature = analyze_topology(probe).ok()?;
-    let strongest = signature.walsh_peaks.first()?.coefficient.abs();
-    let mean = signature
-        .walsh_peaks
-        .iter()
-        .map(|peak| peak.coefficient.abs())
-        .sum::<f64>()
-        / signature.walsh_peaks.len() as f64;
-    if mean == 0.0 {
-        return Some(f64::INFINITY);
-    }
-    Some(strongest / mean)
-}
-
-fn largest_power_of_two_probe(input_len: usize) -> Option<usize> {
-    let capped = input_len.min(8192);
-    let bytes = capped.checked_next_power_of_two().unwrap_or(capped);
-    let probe = if bytes > capped { bytes / 2 } else { bytes };
-    if probe < 8 {
-        None
-    } else {
-        Some(probe)
-    }
-}
-
+#[cfg(test)]
 fn compress_single_layer_bytes(input: &[u8], block_size_bytes: usize) -> Result<Vec<u8>, String> {
+    compress_single_layer_bytes_with_profile(input, block_size_bytes, CompressionProfile::General)
+}
+
+fn compress_single_layer_bytes_with_profile(
+    input: &[u8],
+    block_size_bytes: usize,
+    profile: CompressionProfile,
+) -> Result<Vec<u8>, String> {
     let safe_block_size = if block_size_bytes == 0 {
         DEFAULT_BLOCK_SIZE_BYTES
     } else {
@@ -323,7 +361,7 @@ fn compress_single_layer_bytes(input: &[u8], block_size_bytes: usize) -> Result<
 
     let blocks = input
         .chunks(safe_block_size)
-        .map(encode_block)
+        .map(|block| encode_block_with_profile(block, profile))
         .collect::<Result<Vec<_>, _>>()?;
 
     let archive = Archive {
@@ -592,19 +630,22 @@ fn try_encode_operator_block(
     };
     let base_key_bytes = base_key.serialize();
     let operator = parse_operator_runtime_key(&base_key_bytes)?;
+    let blueprint = base_key.operator_blueprint()?;
     let transformed = words
         .iter()
         .map(|word| apply_operator_word_u_k_with_runtime(*word, &operator))
         .collect::<Result<Vec<_>, _>>()?;
-    let direct_score = grouped_trajectory_score(&words)?;
-    let transformed_score = grouped_trajectory_score(&transformed)?;
+    let direct_score = grouped_operator_score(&words, &blueprint)?;
+    let transformed_score = grouped_operator_score(&transformed, &blueprint)?;
     if !is_better_trajectory_score(transformed_score, direct_score) {
         return Ok(None);
     }
 
     let mut best: Option<BlockEncoding> = None;
     for steps in candidate_steps() {
-        let Some(plan) = build_terminal_palette_plan(&transformed, steps, 256)? else {
+        let Some(plan) =
+            build_operator_terminal_palette_plan(&transformed, &blueprint, steps, 256)?
+        else {
             continue;
         };
         let key_bytes = base_key.serialize().to_vec();
@@ -697,6 +738,176 @@ fn estimate_plan_bits(plan: &TerminalPalettePlan) -> u64 {
     plan.terminals.len() as u64 * 64
         + plan.terminal_indices.len() as u64 * plan.terminal_index_bits as u64
         + plan.breadcrumbs.len() as u64
+}
+
+fn operator_branch_positions(blueprint: &OperatorBlueprint, steps: u8) -> Vec<usize> {
+    (0..steps as usize)
+        .map(|round| {
+            let active_bits = 64 - round;
+            let seed = usize::from(blueprint.peak_indices[round % 3])
+                ^ (usize::from(blueprint.derivative_density) << 1)
+                ^ (usize::from(blueprint.popcnt_density) << 2)
+                ^ (usize::from(blueprint.primary_shift) * (round + 1))
+                ^ (usize::from(blueprint.round_count) * 11)
+                ^ (usize::from(blueprint.phase_parity) * 7)
+                ^ (usize::from(blueprint.peak_signs[round % 3]) * 13);
+            seed % active_bits
+        })
+        .collect()
+}
+
+fn remove_bit_at(value: u64, position: usize) -> u64 {
+    let low_mask = if position == 0 {
+        0
+    } else {
+        (1_u64 << position) - 1
+    };
+    let low = value & low_mask;
+    let high = if position >= 63 {
+        0
+    } else {
+        value >> (position + 1)
+    };
+    low | (high << position)
+}
+
+fn insert_bit_at(value: u64, position: usize, bit: bool) -> u64 {
+    let low_mask = if position == 0 {
+        0
+    } else {
+        (1_u64 << position) - 1
+    };
+    let low = value & low_mask;
+    let high = if position >= 63 { 0 } else { value >> position };
+    low | (u64::from(bit) << position)
+        | if position >= 63 {
+            0
+        } else {
+            high << (position + 1)
+        }
+}
+
+fn encode_operator_trajectory(
+    mut value: u64,
+    blueprint: &OperatorBlueprint,
+    steps: u8,
+) -> Result<ParityTrajectory, String> {
+    if !(1..64).contains(&steps) {
+        return Err("operator trajectory step count must be in 1..64".to_string());
+    }
+    let mut crumbs = Vec::with_capacity(steps as usize);
+    for position in operator_branch_positions(blueprint, steps) {
+        crumbs.push(((value >> position) & 1) == 1);
+        value = remove_bit_at(value, position);
+    }
+    Ok(ParityTrajectory {
+        terminal: value,
+        crumbs,
+    })
+}
+
+fn decode_operator_trajectory(
+    trajectory: &ParityTrajectory,
+    blueprint: &OperatorBlueprint,
+) -> Result<u64, String> {
+    let steps = trajectory.crumbs.len() as u8;
+    if !(1..64).contains(&steps) {
+        return Err("operator trajectory step count must be in 1..64".to_string());
+    }
+    let positions = operator_branch_positions(blueprint, steps);
+    let mut value = trajectory.terminal;
+    for (position, crumb) in positions
+        .into_iter()
+        .zip(trajectory.crumbs.iter().copied())
+        .rev()
+    {
+        value = insert_bit_at(value, position, crumb);
+    }
+    Ok(value)
+}
+
+fn build_operator_terminal_palette_plan(
+    words: &[u64],
+    blueprint: &OperatorBlueprint,
+    steps: u8,
+    max_terminals: usize,
+) -> Result<Option<TerminalPalettePlan>, String> {
+    if words.is_empty() || !(1..64).contains(&steps) || max_terminals == 0 {
+        return Ok(None);
+    }
+
+    let trajectories = words
+        .iter()
+        .map(|value| encode_operator_trajectory(*value, blueprint, steps))
+        .collect::<Result<Vec<_>, _>>()?;
+    let terminals = trajectories
+        .iter()
+        .map(|trajectory| trajectory.terminal)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if terminals.len() > max_terminals || terminals.len() > usize::from(u8::MAX) + 1 {
+        return Ok(None);
+    }
+
+    let index_by_terminal = terminals
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, terminal)| (terminal, index as u8))
+        .collect::<BTreeMap<_, _>>();
+    let terminal_indices = trajectories
+        .iter()
+        .map(|trajectory| {
+            index_by_terminal
+                .get(&trajectory.terminal)
+                .copied()
+                .ok_or_else(|| "operator terminal palette lookup failed".to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let breadcrumbs = trajectories
+        .into_iter()
+        .flat_map(|trajectory| trajectory.crumbs)
+        .collect::<Vec<_>>();
+    Ok(Some(TerminalPalettePlan {
+        terminal_index_bits: bit_width_for_cardinality(terminals.len()),
+        terminals,
+        terminal_indices,
+        breadcrumbs,
+    }))
+}
+
+fn best_grouped_operator_plan(
+    words: &[u64],
+    blueprint: &OperatorBlueprint,
+) -> Result<Option<(u8, TerminalPalettePlan)>, String> {
+    let mut best: Option<(u8, TerminalPalettePlan)> = None;
+    for steps in candidate_steps() {
+        let Some(plan) = build_operator_terminal_palette_plan(words, blueprint, steps, 256)? else {
+            continue;
+        };
+        let better = best
+            .as_ref()
+            .map(|(_, current)| estimate_plan_bits(&plan) < estimate_plan_bits(current))
+            .unwrap_or(true);
+        if better {
+            best = Some((steps, plan));
+        }
+    }
+    Ok(best)
+}
+
+fn grouped_operator_score(
+    words: &[u64],
+    blueprint: &OperatorBlueprint,
+) -> Result<Option<TrajectoryScore>, String> {
+    Ok(
+        best_grouped_operator_plan(words, blueprint)?.map(|(steps, plan)| TrajectoryScore {
+            encoded_bits: estimate_plan_bits(&plan),
+            steps,
+            terminal_count: plan.terminals.len(),
+        }),
+    )
 }
 
 fn best_grouped_trajectory_plan(
@@ -891,6 +1102,9 @@ fn decode_operator_block(block: &OperatorBlock) -> Result<Vec<u8>, String> {
     )?;
     let crumbs = unpack_bools(&block.breadcrumbs, total_steps)?;
     let operator = parse_operator_runtime_key(&block.key)?;
+    let blueprint = MagicKey::parse(&block.key)?
+        .require_kind(MagicKeyKind::Operator)?
+        .operator_blueprint()?;
     let mut out = Vec::with_capacity(block.original_len as usize);
     for (terminal_index, word_crumbs) in terminal_indices
         .into_iter()
@@ -900,10 +1114,13 @@ fn decode_operator_block(block: &OperatorBlock) -> Result<Vec<u8>, String> {
             .terminals
             .get(terminal_index as usize)
             .ok_or_else(|| "operator terminal index is out of range".to_string())?;
-        let transformed = decode_parity_trajectory(&ParityTrajectory {
-            terminal,
-            crumbs: word_crumbs.to_vec(),
-        })?;
+        let transformed = decode_operator_trajectory(
+            &ParityTrajectory {
+                terminal,
+                crumbs: word_crumbs.to_vec(),
+            },
+            &blueprint,
+        )?;
         let word = invert_operator_word_u_k_with_runtime(transformed, &operator)?;
         out.extend_from_slice(&word.to_le_bytes());
     }
@@ -929,168 +1146,49 @@ fn select_operator_codec_key_from_family(
         Some(sig) => sig.clone(),
         None => analyze_topology(block)?,
     };
+    let key = compile_topology_to_key(&signature)?;
     let original_score = grouped_trajectory_score(words)?;
-    let candidates = operator_candidate_family(&signature, words)?;
-    let mut best = None;
-    let mut best_key = None;
-    for candidate in candidates {
-        let score = score_operator_key(words, candidate)?;
-        if is_better_operator_score(score, best) {
-            best = score;
-            best_key = Some(candidate);
-        }
-    }
-
-    if is_better_trajectory_score(best, original_score) {
-        Ok(best_key)
-    } else {
-        Ok(None)
-    }
+    let transformed_score = score_operator_key(words, key)?;
+    Ok(is_better_trajectory_score(transformed_score, original_score).then_some(key))
 }
 
 fn score_operator_key(words: &[u64], key: MagicKey) -> Result<Option<TrajectoryScore>, String> {
     let operator = parse_operator_runtime_key(&key.serialize())?;
+    let blueprint = key.operator_blueprint()?;
     let transformed = words
         .iter()
         .map(|word| apply_operator_word_u_k_with_runtime(*word, &operator))
         .collect::<Result<Vec<_>, _>>()?;
-    grouped_trajectory_score(&transformed)
+    grouped_operator_score(&transformed, &blueprint)
 }
 
-fn is_better_operator_score(
-    candidate: Option<TrajectoryScore>,
-    incumbent: Option<TrajectoryScore>,
-) -> bool {
-    is_better_trajectory_score(candidate, incumbent)
-}
-
-fn operator_candidate_family(
-    signature: &TopologySignature,
-    words: &[u64],
-) -> Result<Vec<MagicKey>, String> {
-    let base = compile_topology_to_key(signature)?;
-    let base_blueprint = base.operator_blueprint()?;
-    let fallback_shift = signature.shift_scores.first();
-    let binary_peaks = strongest_binary_word_peaks(words, 4)?;
-    let mut variants = Vec::new();
-    for (dominant_slot, dominant) in binary_peaks.iter().enumerate() {
-        for (secondary_slot, secondary) in binary_peaks.iter().enumerate() {
-            if secondary_slot == dominant_slot {
-                continue;
-            }
-            let Some(shift) = signature
-                .shift_scores
-                .get((dominant_slot + secondary_slot) % signature.shift_scores.len())
-                .or(fallback_shift)
-            else {
-                continue;
-            };
-            let tertiary = binary_peaks
-                .get((secondary_slot + 1) % binary_peaks.len())
-                .unwrap_or(secondary);
-            let primary_shift = encoded_primary_shift(dominant, secondary, shift.shift as u8);
-            variants.push(OperatorBlueprint {
-                dominant_index: dominant.bit as u16,
-                dominant_positive: dominant.positive,
-                primary_shift,
-                shift_match: quantize_ratio(dominant.bias as usize, words.len(), 9) as u16,
-                derivative_density: base_blueprint.derivative_density,
-                popcnt_density: base_blueprint.popcnt_density,
-                secondary_delta: encode_operator_delta(dominant.bit, secondary.bit),
-                tertiary_delta: encode_operator_delta(dominant.bit, tertiary.bit),
-                fingerprint_bias: ((signature.fingerprint
-                    >> (((dominant_slot + secondary_slot) % 8) * 5))
-                    & 0x1F) as u8,
-            });
-        }
-    }
-    Ok(variants
-        .into_iter()
-        .chain(std::iter::once(base_blueprint))
-        .filter_map(|variant| MagicKey::from_operator_blueprint(&variant).ok())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect())
-}
-
-fn encoded_primary_shift(
-    dominant: &BinaryWordPeak,
-    secondary: &BinaryWordPeak,
-    fallback_shift: u8,
-) -> u8 {
-    let delta = ((secondary.bit as i16 - dominant.bit as i16).rem_euclid(64) as u8) % 31;
-    delta.max(1).max(fallback_shift.min(31))
-}
-
-fn encode_operator_delta(from: u8, to: u8) -> u8 {
-    ((to as i16 - from as i16 - 1).rem_euclid(32)) as u8
-}
-
-fn quantize_ratio(numerator: usize, denominator: usize, bits: u8) -> u64 {
-    if denominator == 0 {
-        return 0;
-    }
-    let max = (1_u64 << bits) - 1;
-    ((numerator as u128 * max as u128 + (denominator as u128 / 2)) / denominator as u128) as u64
-}
-
-fn parse_operator_runtime_key(key_bytes: &[u8]) -> Result<SpectralOperatorKey, String> {
-    let key = MagicKey::parse(key_bytes)?;
-    let blueprint = key
+fn parse_operator_runtime_key(key_bytes: &[u8]) -> Result<BinaryOperatorKey, String> {
+    let blueprint = MagicKey::parse(key_bytes)?
         .require_kind(MagicKeyKind::Operator)?
         .operator_blueprint()?;
-    let dominant_index = u64::from(blueprint.dominant_index);
-    let secondary_index = (dominant_index + u64::from(blueprint.secondary_delta) + 1) & 63;
-    let tertiary_index = (dominant_index
-        + u64::from(blueprint.tertiary_delta)
-        + u64::from(blueprint.primary_shift)
-        + 1)
-        & 63;
-    let seed = dominant_index
-        | (u64::from(blueprint.shift_match) << 13)
-        | (u64::from(blueprint.derivative_density) << 22)
-        | (u64::from(blueprint.popcnt_density) << 30)
-        | (u64::from(blueprint.secondary_delta) << 38)
-        | (u64::from(blueprint.tertiary_delta) << 43)
-        | (u64::from(blueprint.fingerprint_bias) << 48)
-        | (u64::from(blueprint.dominant_positive) << 53);
-    let mask = repeat_byte(blueprint.popcnt_density)
-        ^ repeat_byte(blueprint.derivative_density)
-            .rotate_left((blueprint.shift_match as u32) & 63)
-        ^ (1_u64 << secondary_index)
-        ^ (1_u64 << tertiary_index);
-    let shift_left = ((u16::from(blueprint.primary_shift) + u16::from(blueprint.secondary_delta))
-        % 31
-        + 1) as u8;
-    let shift_right = ((u16::from(blueprint.primary_shift)
-        + u16::from(blueprint.tertiary_delta)
-        + u16::from(blueprint.fingerprint_bias))
-        % 31
-        + 1) as u8;
-    let odd_multiplier = (repeat_byte(blueprint.derivative_density)
-        ^ repeat_byte(blueprint.popcnt_density).rotate_left(u32::from(blueprint.primary_shift))
-        ^ (u64::from(blueprint.fingerprint_bias) << 56)
-        ^ (u64::from(blueprint.shift_match) << 17))
-        | 1;
-    Ok(SpectralOperatorKey {
-        mix: IndexMix {
-            xor_mask: (mask
-                ^ repeat_byte(blueprint.fingerprint_bias)
-                    .rotate_right(u32::from(blueprint.primary_shift)))
-                as usize,
-            rotate: ((u16::from(blueprint.primary_shift)
-                + u16::from(blueprint.secondary_delta)
-                + u16::from(blueprint.fingerprint_bias))
-                % 63
-                + 1) as u8,
-        },
-        phase: PhaseKey {
+    let seed = u64::from(blueprint.peak_indices[0])
+        | (u64::from(blueprint.peak_indices[1]) << 12)
+        | (u64::from(blueprint.peak_indices[2]) << 24)
+        | (u64::from(blueprint.derivative_density) << 36)
+        | (u64::from(blueprint.popcnt_density) << 44)
+        | (u64::from(blueprint.phase_parity) << 52)
+        | (u64::from(blueprint.round_count) << 53);
+    let mut phase_mask = repeat_byte(blueprint.derivative_density)
+        ^ repeat_byte(blueprint.popcnt_density).rotate_left(u32::from(blueprint.primary_shift));
+    for (slot, index) in blueprint.peak_indices.iter().enumerate() {
+        let bit = u32::from((*index & 63) as u8);
+        phase_mask ^= 1_u64.rotate_left(bit);
+        if !blueprint.peak_signs[slot] {
+            phase_mask ^= 1_u64.rotate_left((bit + 17) & 63);
+        }
+    }
+    Ok(BinaryOperatorKey {
+        feistel: crate::domain::kernel::operator::default_feistel_from_seed(
             seed,
-            mask,
-            shift_left,
-            shift_right,
-            odd_multiplier,
-        },
+            blueprint.round_count,
+        ),
+        rotate: blueprint.primary_shift % 64,
+        phase_mask,
     })
 }
 
@@ -1102,26 +1200,14 @@ fn apply_operator_word_u_k(value: u64, key_bytes: &[u8]) -> Result<u64, String> 
 
 fn apply_operator_word_u_k_with_runtime(
     value: u64,
-    operator: &SpectralOperatorKey,
+    operator: &BinaryOperatorKey,
 ) -> Result<u64, String> {
-    let phase = operator.phase.seed
-        ^ operator.phase.mask.rotate_left(17)
-        ^ operator.phase.odd_multiplier.rotate_right(11)
-        ^ (operator.phase.shift_left as u64)
-        ^ ((operator.phase.shift_right as u64) << 8);
-    Ok(apply_binary_u_k(
-        value,
-        BinaryOperatorKey {
-            xor_mask: operator.mix.xor_mask as u64,
-            rotate: operator.mix.rotate,
-            phase_mask: phase,
-        },
-    ))
+    apply_binary_u_k(value, operator)
 }
 
 fn invert_operator_word_u_k_with_runtime(
     value: u64,
-    operator: &SpectralOperatorKey,
+    operator: &BinaryOperatorKey,
 ) -> Result<u64, String> {
     apply_operator_word_u_k_with_runtime(value, operator)
 }
@@ -1321,23 +1407,9 @@ fn decode_position_deltas(bytes: &[u8]) -> Result<Vec<usize>, String> {
     Ok(positions)
 }
 
-fn extract_trajectory_block(block: &BlockEncoding) -> Option<&TrajectoryBlock> {
-    match block {
-        BlockEncoding::Trajectory(trajectory) => Some(trajectory),
-        _ => None,
-    }
-}
-
 fn extract_spectral_block(block: &BlockEncoding) -> Option<&SpectralBlock> {
     match block {
         BlockEncoding::Spectral(spectral) => Some(spectral),
-        _ => None,
-    }
-}
-
-fn extract_operator_block(block: &BlockEncoding) -> Option<&OperatorBlock> {
-    match block {
-        BlockEncoding::Operator(operator) => Some(operator),
         _ => None,
     }
 }
@@ -1879,14 +1951,16 @@ mod compact_codec_tests {
     use super::{
         apply_operator_word_u_k, build_operator_codec_key, compress_bytes,
         compress_bytes_with_outcome, compress_single_layer_bytes, decompress_bytes, encode_block,
-        encoded_size_of, grouped_trajectory_score, inspect_archive, parse_archive,
+        encoded_size_of, grouped_operator_score, inspect_archive, parse_archive,
         score_operator_key, select_operator_codec_key_from_family, serialize_single_layer_archive,
         synthesise_spectral_bytes, try_encode_operator_block, Archive, ArchiveHeader,
         BlockEncoding, MagicKey, OperatorBlock, RawBlock, SpectralBlock, DEFAULT_BLOCK_SIZE_BYTES,
         MAGIC_MULTI,
     };
-    use crate::domain::kernel::operator::strongest_binary_word_peaks;
-    use crate::domain::kernel::topology::{analyze_topology, compile_spectral_key};
+    use crate::domain::kernel::operator::apply_binary_u_k;
+    use crate::domain::kernel::topology::{
+        analyze_topology, compile_spectral_key, compile_topology_to_key,
+    };
 
     fn walsh_basis_bytes(bit_len: usize, basis_index: usize) -> Vec<u8> {
         let mut out = vec![0_u8; bit_len / 8];
@@ -1935,6 +2009,13 @@ mod compact_codec_tests {
             encoded_size_of(&BlockEncoding::SparseAlphabet(sparse.clone()))
                 < encoded_size_of(&plain)
         );
+    }
+
+    #[test]
+    fn strict_generator_only_rejects_inputs_without_a_10x_first_layer() {
+        let input = vec![0xAA_u8; 1024];
+        let error = super::compress_bytes_generator_only_strict(&input, Some(512)).unwrap_err();
+        assert!(error.contains("InsufficientFirstLayerGain"));
     }
 
     #[test]
@@ -2046,7 +2127,7 @@ mod compact_codec_tests {
 
     #[test]
     fn operator_k_is_one_constant_and_u_k_is_an_involution() {
-        let source = [0x3C_u8; 64];
+        let source = [0x3C_u8; 512];
         let key = build_operator_codec_key(&source).unwrap();
         assert_eq!(key.serialize().len(), 8);
         for value in [0, 1, u64::MAX, 0x0123_4567_89AB_CDEF] {
@@ -2060,22 +2141,10 @@ mod compact_codec_tests {
 
     #[test]
     fn operator_codec_runtime_is_direct_binary_u_k() {
-        let source = [0x3C_u8; 64];
+        let source = [0x3C_u8; 512];
         let key = build_operator_codec_key(&source).unwrap();
         let runtime = super::parse_operator_runtime_key(&key.serialize()).unwrap();
-        let phase = runtime.phase.seed
-            ^ runtime.phase.mask.rotate_left(17)
-            ^ runtime.phase.odd_multiplier.rotate_right(11)
-            ^ (runtime.phase.shift_left as u64)
-            ^ ((runtime.phase.shift_right as u64) << 8);
-        let expected = apply_binary_u_k(
-            0x0123_4567_89AB_CDEF,
-            BinaryOperatorKey {
-                xor_mask: runtime.mix.xor_mask as u64,
-                rotate: runtime.mix.rotate,
-                phase_mask: phase,
-            },
-        );
+        let expected = apply_binary_u_k(0x0123_4567_89AB_CDEF, &runtime).unwrap();
         assert_eq!(
             super::apply_operator_word_u_k(0x0123_4567_89AB_CDEF, &key.serialize()).unwrap(),
             expected
@@ -2104,16 +2173,21 @@ mod compact_codec_tests {
                 .chunks_exact(8)
                 .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
                 .collect::<Vec<_>>();
-            if let Some(BlockEncoding::Operator(block)) = try_encode_operator_block(&input).unwrap()
+            if let Some(BlockEncoding::Operator(block)) =
+                try_encode_operator_block(&input, None).unwrap()
             {
-                let key = MagicKey::parse(&block.key).unwrap();
+                let key = MagicKey::parse(&block.key)
+                    .unwrap()
+                    .require_kind(crate::domain::kernel::key::MagicKeyKind::Operator)
+                    .unwrap();
+                let blueprint = key.operator_blueprint().unwrap();
                 let transformed = original_words
                     .iter()
                     .map(|word| apply_operator_word_u_k(*word, &key.serialize()).unwrap())
                     .collect::<Vec<_>>();
                 assert!(super::is_better_trajectory_score(
-                    grouped_trajectory_score(&transformed).unwrap(),
-                    grouped_trajectory_score(&original_words).unwrap()
+                    grouped_operator_score(&transformed, &blueprint).unwrap(),
+                    grouped_operator_score(&original_words, &blueprint).unwrap()
                 ));
             }
         }
@@ -2135,39 +2209,48 @@ mod compact_codec_tests {
             .collect::<Vec<_>>();
         let seed = build_operator_codec_key(&input).unwrap();
         let seed_score = score_operator_key(&words, seed).unwrap();
-        if let Some(found) = select_operator_codec_key_from_family(&input, &words).unwrap() {
+        if let Some(found) = select_operator_codec_key_from_family(&input, &words, None).unwrap() {
             let found_score = score_operator_key(&words, found).unwrap();
             assert!(
-                super::is_better_operator_score(found_score, seed_score)
+                super::is_better_trajectory_score(found_score, seed_score)
                     || found_score == seed_score
             );
         }
     }
 
     #[test]
-    fn operator_family_contains_a_blueprint_built_from_binary_runtime_peaks() {
-        let words = [
-            0x0000_0000_0000_0000_u64,
-            0x0000_0000_0000_0000_u64,
-            0xFFFF_FFFF_FFFF_FFFF_u64,
-            0xFFFF_FFFF_FFFF_FFFF_u64,
-            0x0000_0000_0000_0000_u64,
-            0xFFFF_FFFF_FFFF_FFFF_u64,
-            0x0000_0000_0000_0000_u64,
-            0xFFFF_FFFF_FFFF_FFFF_u64,
-        ];
-        let input = words
-            .iter()
-            .flat_map(|word| word.to_le_bytes())
-            .collect::<Vec<_>>();
+    fn operator_compiler_uses_topology_peaks_directly() {
+        let input = [0xA5_u8; 512];
         let signature = analyze_topology(&input).unwrap();
-        let binary_peak = strongest_binary_word_peaks(&words, 1).unwrap()[0];
-        let family = super::operator_candidate_family(&signature, &words).unwrap();
-        assert!(family.iter().any(|key| {
-            let blueprint = key.operator_blueprint().unwrap();
-            blueprint.dominant_index == binary_peak.bit as u16
-                && blueprint.dominant_positive == binary_peak.positive
-        }));
+        let key = compile_topology_to_key(&signature).unwrap();
+        let blueprint = key.operator_blueprint().unwrap();
+        assert_eq!(
+            usize::from(blueprint.peak_indices[0]),
+            signature.walsh_peaks[0].index
+        );
+        assert_eq!(
+            blueprint.peak_signs[0],
+            !signature.walsh_peaks[0].coefficient.is_sign_negative()
+        );
+        assert_eq!(
+            usize::from(blueprint.primary_shift),
+            signature.shift_scores[0].shift.min(32)
+        );
+    }
+
+    #[test]
+    fn operator_branches_are_k_driven_and_not_low_bit_tail_split() {
+        let key = build_operator_codec_key(&[0x5A_u8; 512]).unwrap();
+        let blueprint = key.operator_blueprint().unwrap();
+        let value = 0xF0E1_D2C3_B4A5_9687_u64;
+        let generated = super::encode_operator_trajectory(value, &blueprint, 9).unwrap();
+        let baseline =
+            crate::domain::kernel::trajectory::encode_parity_trajectory(value, 9).unwrap();
+        assert_ne!(generated.crumbs, baseline.crumbs);
+        assert_eq!(
+            super::decode_operator_trajectory(&generated, &blueprint).unwrap(),
+            value
+        );
     }
 
     #[test]
@@ -2219,24 +2302,23 @@ mod compact_codec_tests {
     }
 
     #[test]
-    fn operator_wire_format_roundtrips_terminal_palette_steps_and_parity() {
-        let source = [0x3C_u8; 64];
+    fn operator_wire_format_roundtrips_terminal_palette_steps_and_k_driven_branches() {
+        let source = [0x3C_u8; 512];
         let key = build_operator_codec_key(&source).unwrap();
+        let blueprint = key.operator_blueprint().unwrap();
         let values = [0x0123_4567_89AB_CDEF_u64, 0x1123_4567_89AB_CDEE_u64];
         let transformed = values
             .iter()
             .map(|value| apply_operator_word_u_k(*value, &key.serialize()).unwrap())
             .collect::<Vec<_>>();
-        let left = crate::domain::kernel::trajectory::encode_parity_trajectory(transformed[0], 63)
-            .unwrap();
-        let right = crate::domain::kernel::trajectory::encode_parity_trajectory(transformed[1], 63)
-            .unwrap();
+        let left = super::encode_operator_trajectory(transformed[0], &blueprint, 17).unwrap();
+        let right = super::encode_operator_trajectory(transformed[1], &blueprint, 17).unwrap();
         let block = OperatorBlock {
             original_len: 16,
             key: key.serialize().to_vec(),
             terminals: vec![left.terminal, right.terminal],
             terminal_indices: crate::domain::bitstream::pack_indices(&[0, 1], 1),
-            steps: 63,
+            steps: 17,
             breadcrumbs: super::pack_bools(&[left.crumbs.clone(), right.crumbs.clone()].concat()),
         };
         let expected = values
@@ -2321,7 +2403,9 @@ mod compact_codec_tests {
     #[test]
     fn operator_transform_is_involution() {
         // apply дважды должен вернуть исходное значение (функция инволютивна)
-        let block: Vec<u8> = (0u8..64).map(|i| i.wrapping_mul(7) ^ 0xAB).collect();
+        let block: Vec<u8> = (0u16..512)
+            .map(|i| (i as u8).wrapping_mul(7) ^ 0xAB)
+            .collect();
         let key = build_operator_codec_key(&block).unwrap();
         let original: u64 = 0x0123_4567_89AB_CDEF;
         let transformed = apply_operator_word_u_k(original, &key.serialize()).unwrap();
