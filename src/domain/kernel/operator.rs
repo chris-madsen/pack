@@ -124,6 +124,10 @@ pub fn contract_block(
             *word = remove_bit_at(*word, geometry.pivot) & word_mask(live_bits - 1);
         }
         live_bits -= 1;
+        // Apply nonlinear word permutation between contraction rounds so that
+        // the pivot geometry for the next round sees a shuffled word order.
+        // This must be inverted in expand_block in the matching reverse order.
+        apply_runtime_routing_forward(&mut words, &runtime.layout);
     }
     let seed = encode_terminal_seed(&words, live_bits)?;
     Ok((seed, encode_branch_log(&branches)))
@@ -141,6 +145,9 @@ pub fn expand_block(
     let mut cursor = crumbs.len();
     let mut live_bits = final_live_bits;
     for round in (0..runtime.layout.branch_rounds as usize).rev() {
+        // Invert the per-round routing that was applied in contract_block
+        // before restoring the branch bit for this round.
+        apply_runtime_routing_inverse(&mut words, &runtime.layout);
         live_bits += 1;
         let geometry = branch_geometry(&runtime.layout, round, live_bits)?;
         for index in (0..words.len()).rev() {
@@ -673,25 +680,18 @@ fn apply_runtime_routing_inverse(words: &mut [u64], layout: &ConstantLayout) {
     }
 }
 
-fn runtime_analysis_mask(layout: &ConstantLayout, round: usize, live_bits: usize) -> u64 {
+/// Compute the analysis mask for a given branch round.
+///
+/// Uses only the `dominant_walsh_mask` field (intersected with the live-bit
+/// window) as the pivot source.  Earlier versions also OR'd in a
+/// `family_mix` term derived from `phase_mask`, `affine_mask`, and
+/// `odd_multiplier`; that blend introduced spurious bits that made pivot
+/// selection unstable across rounds and could cause the mask to become zero
+/// prematurely.  The dominant Walsh mask is the statistically grounded
+/// predictor of the parity bias and is sufficient on its own.
+fn runtime_analysis_mask(layout: &ConstantLayout, _round: usize, live_bits: usize) -> u64 {
     let live_mask = word_mask(live_bits);
-    let base = layout.dominant_walsh_mask & live_mask;
-    let affine = layout.affine_mask.unwrap_or(0);
-    let family_mix = match layout.family {
-        ConstantFamily::PhaseXor => layout.phase_mask,
-        ConstantFamily::OddAffine => affine ^ layout.odd_multiplier,
-        ConstantFamily::Hybrid => layout.phase_mask ^ affine ^ layout.odd_multiplier,
-    };
-    let rotate = ((usize::from(layout.rotate_left) * (round + 1))
-        + usize::from(layout.rotate_right)
-        + usize::from(layout.gf2_shift) * usize::from(layout.branch_stride)
-        + usize::from(layout.pivot_seed)
-        + usize::from(layout.branch_span))
-        % 64;
-    let mixed = (family_mix.rotate_left(rotate as u32)
-        ^ repeat_byte(layout.pivot_seed ^ layout.branch_stride ^ layout.branch_span))
-        & live_mask;
-    (base | mixed) & live_mask
+    layout.dominant_walsh_mask & live_mask
 }
 
 fn select_runtime_pivot(
