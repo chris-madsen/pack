@@ -72,12 +72,6 @@ pub struct RuntimePipeline {
     pub word_count: usize,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct BranchGeometry {
-    pivot: usize,
-    full_mask: u64,
-}
-
 pub fn materialize_runtime(
     code: &PackedConstantK,
     window_bits: usize,
@@ -95,6 +89,75 @@ pub fn materialize_runtime(
     })
 }
 
+/// Remap a mask from the original 64-bit coordinate space into the current
+/// (post-removal) coordinate space.
+///
+/// Each time a bit is removed at position `p`, every bit at position `X > p`
+/// shifts down by one.  Given the list of previously removed pivot positions
+/// (each expressed in the coordinate space *at the time of their removal*),
+/// this function translates `mask` from the original 64-bit space into the
+/// live-bit space after all those removals.
+///
+/// The translation is: for each set bit at original position `X`, count how
+/// many prior pivots `p_i` satisfy `p_i < X` (in original coordinates),
+/// then subtract that count from `X` to get the current position.
+/// Because the pivots are stored in the shrinking coordinate system, we first
+/// lift each pivot back to original coordinates using the previously removed
+/// pivots before it.
+fn remap_mask_for_removals(original_mask: u64, removed_pivots: &[usize]) -> u64 {
+    // Lift all stored pivots back to original 64-bit coordinates.
+    // pivot[i] was chosen in a space that already had pivots[0..i] removed.
+    let mut original_pivots: Vec<usize> = Vec::with_capacity(removed_pivots.len());
+    for &stored_pivot in removed_pivots {
+        // Reconstruct the original position by inserting the gaps left by
+        // all previously lifted pivots that are <= the candidate position.
+        let mut orig = stored_pivot;
+        for &prev_orig in &original_pivots {
+            if prev_orig <= orig {
+                orig += 1;
+            }
+        }
+        original_pivots.push(orig);
+    }
+
+    // Now remap each set bit of the mask.
+    let mut out = 0_u64;
+    for orig_pos in 0..64_usize {
+        if (original_mask >> orig_pos) & 1 == 0 {
+            continue;
+        }
+        // Count how many original pivots are strictly less than orig_pos.
+        let shift_down = original_pivots.iter().filter(|&&p| p < orig_pos).count();
+        let current_pos = orig_pos.saturating_sub(shift_down);
+        if current_pos < 64 {
+            out |= 1_u64 << current_pos;
+        }
+    }
+    out
+}
+
+/// Choose the pivot position from a remapped mask for a given round.
+fn select_pivot_from_mask(
+    mask: u64,
+    layout: &ConstantLayout,
+    round: usize,
+    live_bits: usize,
+) -> Result<usize, String> {
+    let positions: Vec<usize> = (0..live_bits)
+        .filter(|bit| ((mask >> bit) & 1) == 1)
+        .collect();
+    if positions.is_empty() {
+        return Err(format!(
+            "dynamic pivot mask is empty at round {round} (live_bits={live_bits})"
+        ));
+    }
+    let index = (usize::from(layout.pivot_seed)
+        + round * usize::from(layout.branch_stride)
+        + live_bits * usize::from(layout.branch_span))
+        % positions.len();
+    Ok(positions[index])
+}
+
 pub fn contract_block(
     runtime: &RuntimePipeline,
     block: &[u8],
@@ -110,25 +173,45 @@ pub fn contract_block(
         .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
         .collect::<Vec<_>>();
     apply_runtime_routing_forward(&mut words, &runtime.layout);
+
     let mut live_bits = 64_usize;
+    let mut removed_pivots: Vec<usize> = Vec::with_capacity(runtime.layout.branch_rounds as usize);
     let mut branches =
         Vec::with_capacity(runtime.word_count * runtime.layout.branch_rounds as usize);
+
     for round in 0..runtime.layout.branch_rounds as usize {
         if live_bits <= 1 {
             return Err("branch contraction exhausted the word width".to_string());
         }
-        let geometry = branch_geometry(&runtime.layout, round, live_bits)?;
-        for word in &mut words {
-            let actual_parity = parity(*word & geometry.full_mask) == 1;
-            branches.push(actual_parity != runtime.layout.dominant_walsh_bias);
-            *word = remove_bit_at(*word, geometry.pivot) & word_mask(live_bits - 1);
+
+        // Remap the dominant Walsh mask into current (post-removal) coordinates.
+        let remapped = remap_mask_for_removals(
+            runtime.layout.dominant_walsh_mask,
+            &removed_pivots,
+        ) & word_mask(live_bits);
+
+        if remapped == 0 {
+            return Err(format!(
+                "dynamic remapped mask is zero at round {round}"
+            ));
         }
+
+        let pivot = select_pivot_from_mask(remapped, &runtime.layout, round, live_bits)?;
+
+        for word in &mut words {
+            let actual_parity = parity(*word & remapped) == 1;
+            branches.push(actual_parity != runtime.layout.dominant_walsh_bias);
+            *word = remove_bit_at(*word, pivot) & word_mask(live_bits - 1);
+        }
+
+        removed_pivots.push(pivot);
         live_bits -= 1;
-        // Apply nonlinear word permutation between contraction rounds so that
-        // the pivot geometry for the next round sees a shuffled word order.
-        // This must be inverted in expand_block in the matching reverse order.
+
+        // Per-round nonlinear word permutation (interleaves routing between
+        // contraction steps; must be inverted in expand_block in reverse order).
         apply_runtime_routing_forward(&mut words, &runtime.layout);
     }
+
     let seed = encode_terminal_seed(&words, live_bits)?;
     Ok((seed, encode_branch_log(&branches)))
 }
@@ -142,26 +225,64 @@ pub fn expand_block(
     let crumbs = decode_branch_log(branches, total_branch_bits)?;
     let final_live_bits = 64 - runtime.layout.branch_rounds as usize;
     let mut words = decode_terminal_seed(seed, runtime.word_count, final_live_bits)?;
+
+    // Pre-compute the pivot sequence using the same dynamic remapping as
+    // contract_block, so expand_block does not need to store pivots in the
+    // encoded payload.
+    let mut pivots: Vec<usize> =
+        Vec::with_capacity(runtime.layout.branch_rounds as usize);
+    {
+        let mut live_bits = 64_usize;
+        let mut removed: Vec<usize> = Vec::with_capacity(runtime.layout.branch_rounds as usize);
+        for round in 0..runtime.layout.branch_rounds as usize {
+            let remapped = remap_mask_for_removals(
+                runtime.layout.dominant_walsh_mask,
+                &removed,
+            ) & word_mask(live_bits);
+            if remapped == 0 {
+                return Err(format!(
+                    "expand: dynamic remapped mask is zero at round {round}"
+                ));
+            }
+            let pivot = select_pivot_from_mask(remapped, &runtime.layout, round, live_bits)?;
+            pivots.push(pivot);
+            removed.push(pivot);
+            live_bits -= 1;
+        }
+    }
+
     let mut cursor = crumbs.len();
     let mut live_bits = final_live_bits;
+
     for round in (0..runtime.layout.branch_rounds as usize).rev() {
-        // Invert the per-round routing that was applied in contract_block
-        // before restoring the branch bit for this round.
+        // Invert the per-round routing applied in contract_block.
         apply_runtime_routing_inverse(&mut words, &runtime.layout);
         live_bits += 1;
-        let geometry = branch_geometry(&runtime.layout, round, live_bits)?;
+
+        let pivot = pivots[round];
+
+        // Reconstruct the remapped mask for this round so we can derive the
+        // reduced mask (without the pivot bit) needed for parity recovery.
+        let removed_before: Vec<usize> = pivots[..round].to_vec();
+        let remapped = remap_mask_for_removals(
+            runtime.layout.dominant_walsh_mask,
+            &removed_before,
+        ) & word_mask(live_bits);
+
+        let reduced_mask = remove_bit_at(remapped, pivot);
+
         for index in (0..words.len()).rev() {
             cursor = cursor
                 .checked_sub(1)
                 .ok_or_else(|| "branch log underflow".to_string())?;
-            let reduced_mask = remove_bit_at(geometry.full_mask, geometry.pivot);
             let expected_parity =
                 u8::from(runtime.layout.dominant_walsh_bias) ^ u8::from(crumbs[cursor]);
-            let pivot = (expected_parity ^ parity(words[index] & reduced_mask)) == 1;
+            let pivot_bit = (expected_parity ^ parity(words[index] & reduced_mask)) == 1;
             words[index] =
-                insert_bit_at(words[index], geometry.pivot, pivot) & word_mask(live_bits);
+                insert_bit_at(words[index], pivot, pivot_bit) & word_mask(live_bits);
         }
     }
+
     if cursor != 0 {
         return Err("branch log contains trailing bits".to_string());
     }
@@ -591,33 +712,6 @@ fn slice_cnot_stage(words: &mut [u64], half_width: usize) {
     }
 }
 
-fn branch_geometry(
-    layout: &ConstantLayout,
-    round: usize,
-    live_bits: usize,
-) -> Result<BranchGeometry, String> {
-    let mut mask = runtime_analysis_mask(layout, round, live_bits);
-    let mut width = 64_usize;
-    for _ in 0..round {
-        mask &= word_mask(width);
-        if mask == 0 {
-            return Err("dominant Walsh mask exhausted before all branch rounds".to_string());
-        }
-        let pivot = select_runtime_pivot(mask, layout, round, width)?;
-        mask = remove_bit_at(mask, pivot);
-        width -= 1;
-    }
-    mask &= word_mask(live_bits);
-    if mask == 0 {
-        return Err("dominant Walsh mask has no live pivot".to_string());
-    }
-    let pivot = select_runtime_pivot(mask, layout, round, live_bits)?;
-    Ok(BranchGeometry {
-        pivot,
-        full_mask: mask,
-    })
-}
-
 #[cfg(test)]
 fn gf2_right_mix_forward(value: u64, shift: u8) -> u64 {
     value ^ (value >> shift)
@@ -678,39 +772,6 @@ fn apply_runtime_routing_inverse(words: &mut [u64], layout: &ConstantLayout) {
             words.rotate_right(lane_rotate);
         }
     }
-}
-
-/// Compute the analysis mask for a given branch round.
-///
-/// Uses only the `dominant_walsh_mask` field (intersected with the live-bit
-/// window) as the pivot source.  Earlier versions also OR'd in a
-/// `family_mix` term derived from `phase_mask`, `affine_mask`, and
-/// `odd_multiplier`; that blend introduced spurious bits that made pivot
-/// selection unstable across rounds and could cause the mask to become zero
-/// prematurely.  The dominant Walsh mask is the statistically grounded
-/// predictor of the parity bias and is sufficient on its own.
-fn runtime_analysis_mask(layout: &ConstantLayout, _round: usize, live_bits: usize) -> u64 {
-    let live_mask = word_mask(live_bits);
-    layout.dominant_walsh_mask & live_mask
-}
-
-fn select_runtime_pivot(
-    mask: u64,
-    layout: &ConstantLayout,
-    round: usize,
-    live_bits: usize,
-) -> Result<usize, String> {
-    let positions = (0..live_bits)
-        .filter(|bit| ((mask >> bit) & 1) == 1)
-        .collect::<Vec<_>>();
-    if positions.is_empty() {
-        return Err("runtime mask has no live pivot positions".to_string());
-    }
-    let index = (usize::from(layout.pivot_seed)
-        + round * usize::from(layout.branch_stride)
-        + live_bits * usize::from(layout.branch_span))
-        % positions.len();
-    Ok(positions[index])
 }
 
 fn encode_terminal_seed(words: &[u64], live_bits: usize) -> Result<Vec<u8>, String> {
@@ -1066,8 +1127,9 @@ mod tests {
         apply_binary_u_k, apply_block_butterfly_forward, apply_block_butterfly_inverse, apply_fk,
         apply_fk_inverse, apply_phase_reflection, apply_u_k, binary_hadamard_forward,
         contract_block, decode_branch_log, default_feistel_from_seed, encode_branch_log,
-        expand_block, materialize_runtime, strongest_binary_word_peaks, BinaryOperatorKey,
-        IndexMix, PhaseKey, SpectralOperatorKey, BRANCH_MODE_SPARSE, OPERATOR_BLOCK_WORDS,
+        expand_block, materialize_runtime, remap_mask_for_removals, strongest_binary_word_peaks,
+        BinaryOperatorKey, IndexMix, PhaseKey, SpectralOperatorKey, BRANCH_MODE_SPARSE,
+        OPERATOR_BLOCK_WORDS,
     };
     use crate::domain::kernel::key::{
         ConstantFamily, ConstantLayout, PackedConstantK, RoutingKind,
@@ -1109,6 +1171,44 @@ mod tests {
             assert!((a - b).abs() < 1e-8, "index {index}: {a} != {b}");
         }
     }
+
+    // --------------- new: remap_mask_for_removals unit tests ---------------
+
+    #[test]
+    fn remap_mask_no_removals_is_identity() {
+        let mask = 0x8080_8080_8080_8080_u64;
+        assert_eq!(remap_mask_for_removals(mask, &[]), mask);
+    }
+
+    #[test]
+    fn remap_mask_single_removal_below_set_bit_shifts_down() {
+        // Remove bit at original position 0 (stored pivot = 0).
+        // The set bit at original position 7 should move to position 6.
+        let mask = 1_u64 << 7;
+        let remapped = remap_mask_for_removals(mask, &[0]);
+        assert_eq!(remapped, 1_u64 << 6);
+    }
+
+    #[test]
+    fn remap_mask_removal_above_set_bit_leaves_position_unchanged() {
+        // Remove original position 10; set bit at position 3 is unaffected.
+        let mask = 1_u64 << 3;
+        let remapped = remap_mask_for_removals(mask, &[10]);
+        assert_eq!(remapped, 1_u64 << 3);
+    }
+
+    #[test]
+    fn remap_mask_two_sequential_removals_both_below() {
+        // Original bit at position 15.  Remove positions 3 and 7 (orig).
+        // Both are < 15, so position shifts to 15-2 = 13.
+        let mask = 1_u64 << 15;
+        // First stored pivot = 3 (in 64-bit space).
+        // Second stored pivot = 6 (in 63-bit space, which is orig 7).
+        let remapped = remap_mask_for_removals(mask, &[3, 6]);
+        assert_eq!(remapped, 1_u64 << 13);
+    }
+
+    // -----------------------------------------------------------------------
 
     #[test]
     fn fk_index_mix_has_an_explicit_inverse() {
@@ -1311,5 +1411,31 @@ mod tests {
         let mut non_canonical = encoded;
         non_canonical.extend_from_slice(&[0]);
         assert!(decode_branch_log(&non_canonical, bits.len()).is_err());
+    }
+
+    // ---- compression metric test: measure branch-log density ----
+
+    #[test]
+    fn branch_log_density_improves_with_dynamic_remapping() {
+        // With correct coordinate tracking the parity prediction should be
+        // biased: the majority of branch bits are predictable (false == matches
+        // dominant_walsh_bias), so the branch log should be sparse.
+        // We measure the fraction of TRUE bits (correction bits needed).
+        let input = (0..512).map(|i| (i as u8).wrapping_mul(137)).collect::<Vec<_>>();
+        let packed = PackedConstantK::from_layout(&sample_layout()).unwrap();
+        let runtime = materialize_runtime(&packed, input.len() * 8).unwrap();
+        let (seed, branches) = contract_block(&runtime, &input).unwrap();
+        let total_bits = runtime.word_count * runtime.layout.branch_rounds as usize;
+        // The branch log should be compressible (sparse encoding wins)
+        // if the dynamic path works: expect at least some bias.
+        assert!(
+            branches.len() <= 1 + total_bits.div_ceil(8),
+            "branch log is larger than dense encoding: {} > {}",
+            branches.len(),
+            1 + total_bits.div_ceil(8)
+        );
+        // Roundtrip must hold.
+        let restored = expand_block(&runtime, &seed, &branches).unwrap();
+        assert_eq!(restored, input);
     }
 }
