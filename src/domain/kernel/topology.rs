@@ -1,6 +1,7 @@
 use crate::domain::kernel::key::MagicKey;
 use crate::domain::kernel::key::{ConstantFamily, ConstantLayout, PackedConstantK, RoutingKind};
 use crate::domain::kernel::key::{SpectralPeakCode, SpectralProgram, MAX_SPECTRAL_PEAKS};
+use crate::domain::kernel::operator::strongest_binary_word_peaks;
 
 /// A Walsh dominance ratio ≥ this threshold (out of 1024) indicates that a
 /// single spectral peak accounts for ≥ 68% of total spectral energy. Empirically
@@ -234,7 +235,7 @@ pub fn compile_topology_to_constant(
     let shift0 = signature.shift_scores[0].shift.max(1);
     let peak_gap = peak0.abs_diff(peak1).max(1);
     let word_count = (window_bits / 64).max(1);
-    let branch_rounds = signature.word_parity.mask.count_ones().clamp(1, 16) as u8;
+    let branch_rounds = select_branch_rounds(word_count, signature.word_parity);
     let phase_mask = phase_mask_from_signature(signature);
     let affine_mask = affine_mask_from_signature(signature);
     let odd_multiplier = odd_multiplier_from_signature(signature);
@@ -271,6 +272,11 @@ fn strongest_word_parity_feature(bytes: &[u8]) -> Result<WordParityFeature, Stri
         .collect::<Vec<_>>();
     let mut masks = (0..64).map(|bit| 1_u64 << bit).collect::<Vec<_>>();
     masks.extend((0..8).map(|bit| 0x0101_0101_0101_0101_u64 << bit));
+    masks.extend(
+        strongest_binary_word_peaks(&words, 8)?
+            .into_iter()
+            .map(|peak| walsh_row_mask(peak.bit)),
+    );
     masks.sort_unstable();
     masks.dedup();
 
@@ -297,6 +303,28 @@ fn strongest_word_parity_feature(bytes: &[u8]) -> Result<WordParityFeature, Stri
             )
         })
         .ok_or_else(|| "word parity analysis produced no candidate mask".to_string())
+}
+
+fn walsh_row_mask(index: u8) -> u64 {
+    (0..64).fold(0_u64, |mask, position| {
+        let parity = ((position as u64 & index as u64).count_ones() & 1) == 1;
+        mask | (u64::from(parity) << position)
+    })
+}
+
+fn select_branch_rounds(word_count: usize, feature: WordParityFeature) -> u8 {
+    let max_rounds = feature.mask.count_ones().clamp(1, 16) as u8;
+    let anomaly_words = word_count.saturating_sub(feature.matching_words);
+    (1..=max_rounds)
+        .min_by_key(|rounds| {
+            let seed_bits = word_count.saturating_mul(64 - *rounds as usize);
+            let anomaly_total = anomaly_words.saturating_mul(*rounds as usize);
+            let dense_bits = 8 + (word_count * *rounds as usize).div_ceil(8) * 8;
+            let sparse_bits = 8 + anomaly_total.saturating_mul(8);
+            let branch_bits = dense_bits.min(sparse_bits);
+            seed_bits + branch_bits
+        })
+        .unwrap_or(1)
 }
 
 pub fn compile_spectral_key(signature: &TopologySignature) -> Result<MagicKey, String> {
@@ -814,7 +842,7 @@ mod tests {
     use super::{
         analyze_topology, circular_bit_derivative, compile_spectral_key,
         compile_strict_operator_key, compile_topology_to_constant, popcnt_profile,
-        shift_correlation, MAX_SPECTRAL_PEAKS,
+        select_branch_rounds, shift_correlation, WordParityFeature, MAX_SPECTRAL_PEAKS,
     };
     use crate::domain::kernel::key::{ConstantFamily, PackedConstantK};
 
@@ -881,6 +909,16 @@ mod tests {
         assert_eq!(layout.dominant_walsh_mask, signature.word_parity.mask);
         assert_eq!(layout.dominant_walsh_bias, signature.word_parity.bias);
         assert!(u32::from(layout.branch_rounds) <= layout.dominant_walsh_mask.count_ones());
+    }
+
+    #[test]
+    fn branch_rounds_are_selected_by_economic_estimate_not_mask_popcount() {
+        let feature = WordParityFeature {
+            mask: 0xFF,
+            bias: false,
+            matching_words: 0,
+        };
+        assert_eq!(select_branch_rounds(32, feature), 1);
     }
 
     #[test]

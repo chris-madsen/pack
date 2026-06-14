@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::domain::bitstream::{bit_width_for_cardinality, pack_indices, unpack_indices};
-use crate::domain::kernel::key::{ConstantLayout, PackedConstantK};
+use crate::domain::kernel::key::{ConstantFamily, ConstantLayout, PackedConstantK, RoutingKind};
 use crate::domain::kernel::reversible::{
     feistel_forward, feistel_inverse, FeistelKey, FeistelRoundKey,
 };
@@ -109,6 +109,7 @@ pub fn contract_block(
         .chunks_exact(8)
         .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
         .collect::<Vec<_>>();
+    apply_runtime_routing_forward(&mut words, &runtime.layout);
     let mut live_bits = 64_usize;
     let mut branches =
         Vec::with_capacity(runtime.word_count * runtime.layout.branch_rounds as usize);
@@ -157,6 +158,7 @@ pub fn expand_block(
     if cursor != 0 {
         return Err("branch log contains trailing bits".to_string());
     }
+    apply_runtime_routing_inverse(&mut words, &runtime.layout);
     Ok(words.into_iter().flat_map(u64::to_le_bytes).collect())
 }
 
@@ -587,14 +589,14 @@ fn branch_geometry(
     round: usize,
     live_bits: usize,
 ) -> Result<BranchGeometry, String> {
-    let mut mask = layout.dominant_walsh_mask;
+    let mut mask = runtime_analysis_mask(layout, round, live_bits);
     let mut width = 64_usize;
     for _ in 0..round {
         mask &= word_mask(width);
         if mask == 0 {
             return Err("dominant Walsh mask exhausted before all branch rounds".to_string());
         }
-        let pivot = mask.trailing_zeros() as usize;
+        let pivot = select_runtime_pivot(mask, layout, round, width)?;
         mask = remove_bit_at(mask, pivot);
         width -= 1;
     }
@@ -602,7 +604,7 @@ fn branch_geometry(
     if mask == 0 {
         return Err("dominant Walsh mask has no live pivot".to_string());
     }
-    let pivot = mask.trailing_zeros() as usize;
+    let pivot = select_runtime_pivot(mask, layout, round, live_bits)?;
     Ok(BranchGeometry {
         pivot,
         full_mask: mask,
@@ -631,6 +633,84 @@ fn mod_inverse_odd_u64(value: u64) -> u64 {
         inverse = inverse.wrapping_mul(2_u64.wrapping_sub(value.wrapping_mul(inverse)));
     }
     inverse
+}
+
+fn apply_runtime_routing_forward(words: &mut [u64], layout: &ConstantLayout) {
+    if words.len() < 2 {
+        return;
+    }
+    let lane_rotate = usize::from(layout.lane_rotate) % words.len();
+    match layout.routing {
+        RoutingKind::Identity => {}
+        RoutingKind::RotateWords => words.rotate_left(lane_rotate),
+        RoutingKind::ReverseWords => {
+            words.rotate_left(lane_rotate);
+            words.reverse();
+        }
+        RoutingKind::Butterfly => {
+            words.rotate_left(lane_rotate);
+            apply_slice_butterfly_forward(words);
+        }
+    }
+}
+
+fn apply_runtime_routing_inverse(words: &mut [u64], layout: &ConstantLayout) {
+    if words.len() < 2 {
+        return;
+    }
+    let lane_rotate = usize::from(layout.lane_rotate) % words.len();
+    match layout.routing {
+        RoutingKind::Identity => {}
+        RoutingKind::RotateWords => words.rotate_right(lane_rotate),
+        RoutingKind::ReverseWords => {
+            words.reverse();
+            words.rotate_right(lane_rotate);
+        }
+        RoutingKind::Butterfly => {
+            apply_slice_butterfly_inverse(words);
+            words.rotate_right(lane_rotate);
+        }
+    }
+}
+
+fn runtime_analysis_mask(layout: &ConstantLayout, round: usize, live_bits: usize) -> u64 {
+    let live_mask = word_mask(live_bits);
+    let base = layout.dominant_walsh_mask & live_mask;
+    let affine = layout.affine_mask.unwrap_or(0);
+    let family_mix = match layout.family {
+        ConstantFamily::PhaseXor => layout.phase_mask,
+        ConstantFamily::OddAffine => affine ^ layout.odd_multiplier,
+        ConstantFamily::Hybrid => layout.phase_mask ^ affine ^ layout.odd_multiplier,
+    };
+    let rotate = ((usize::from(layout.rotate_left) * (round + 1))
+        + usize::from(layout.rotate_right)
+        + usize::from(layout.gf2_shift) * usize::from(layout.branch_stride)
+        + usize::from(layout.pivot_seed)
+        + usize::from(layout.branch_span))
+        % 64;
+    let mixed = (family_mix.rotate_left(rotate as u32)
+        ^ repeat_byte(layout.pivot_seed ^ layout.branch_stride ^ layout.branch_span))
+        & live_mask;
+    (base | mixed) & live_mask
+}
+
+fn select_runtime_pivot(
+    mask: u64,
+    layout: &ConstantLayout,
+    round: usize,
+    live_bits: usize,
+) -> Result<usize, String> {
+    let positions = (0..live_bits)
+        .filter(|bit| ((mask >> bit) & 1) == 1)
+        .collect::<Vec<_>>();
+    if positions.is_empty() {
+        return Err("runtime mask has no live pivot positions".to_string());
+    }
+    let index = (usize::from(layout.pivot_seed)
+        + round * usize::from(layout.branch_stride)
+        + live_bits * usize::from(layout.branch_span))
+        % positions.len();
+    Ok(positions[index])
 }
 
 fn encode_terminal_seed(words: &[u64], live_bits: usize) -> Result<Vec<u8>, String> {
@@ -944,7 +1024,6 @@ fn unpack_bools_local(bytes: &[u8], count: usize) -> Result<Vec<bool>, String> {
         .collect())
 }
 
-#[cfg(test)]
 fn repeat_byte(byte: u8) -> u64 {
     u64::from_le_bytes([byte; 8])
 }
@@ -1150,6 +1229,73 @@ mod tests {
         assert!(expand_block(&runtime, &seed, &changed)
             .map(|decoded| decoded != input)
             .unwrap_or(true));
+    }
+
+    #[test]
+    fn runtime_routing_changes_operator_payload_and_preserves_roundtrip() {
+        let input = (0..512).map(|index| index as u8).collect::<Vec<_>>();
+        let mut identity = sample_layout();
+        identity.routing = RoutingKind::Identity;
+        identity.lane_rotate = 0;
+        let mut butterfly = identity;
+        butterfly.routing = RoutingKind::Butterfly;
+        butterfly.lane_rotate = 5;
+
+        let identity_key = PackedConstantK::from_layout(&identity).unwrap();
+        let butterfly_key = PackedConstantK::from_layout(&butterfly).unwrap();
+        let identity_runtime = materialize_runtime(&identity_key, input.len() * 8).unwrap();
+        let butterfly_runtime = materialize_runtime(&butterfly_key, input.len() * 8).unwrap();
+
+        let identity_payload = contract_block(&identity_runtime, &input).unwrap();
+        let butterfly_payload = contract_block(&butterfly_runtime, &input).unwrap();
+
+        assert_ne!(identity_payload, butterfly_payload);
+        assert_eq!(
+            expand_block(&identity_runtime, &identity_payload.0, &identity_payload.1).unwrap(),
+            input
+        );
+        assert_eq!(
+            expand_block(
+                &butterfly_runtime,
+                &butterfly_payload.0,
+                &butterfly_payload.1
+            )
+            .unwrap(),
+            input
+        );
+    }
+
+    #[test]
+    fn pivot_geometry_fields_change_operator_payload_and_preserve_roundtrip() {
+        let input = (0..512)
+            .map(|index| (index as u8).wrapping_mul(29))
+            .collect::<Vec<_>>();
+        let mut first = sample_layout();
+        first.pivot_seed = 3;
+        first.branch_stride = 2;
+        first.branch_span = 5;
+        let mut second = first;
+        second.pivot_seed = 19;
+        second.branch_stride = 7;
+        second.branch_span = 11;
+
+        let first_key = PackedConstantK::from_layout(&first).unwrap();
+        let second_key = PackedConstantK::from_layout(&second).unwrap();
+        let first_runtime = materialize_runtime(&first_key, input.len() * 8).unwrap();
+        let second_runtime = materialize_runtime(&second_key, input.len() * 8).unwrap();
+
+        let first_payload = contract_block(&first_runtime, &input).unwrap();
+        let second_payload = contract_block(&second_runtime, &input).unwrap();
+
+        assert_ne!(first_payload, second_payload);
+        assert_eq!(
+            expand_block(&first_runtime, &first_payload.0, &first_payload.1).unwrap(),
+            input
+        );
+        assert_eq!(
+            expand_block(&second_runtime, &second_payload.0, &second_payload.1).unwrap(),
+            input
+        );
     }
 
     #[test]
