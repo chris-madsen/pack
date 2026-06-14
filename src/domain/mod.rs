@@ -1,8 +1,8 @@
-pub(crate) mod bitstream;
-pub(crate) mod codec;
+pub mod bitstream;
+pub mod codec;
 #[cfg(test)]
-pub(crate) mod codec_tests;
-pub(crate) mod kernel;
-pub(crate) mod metagenerator;
-pub(crate) mod model;
-pub(crate) mod window;
+pub mod codec_tests;
+pub mod kernel;
+pub mod metagenerator;
+pub mod model;
+pub mod window;
