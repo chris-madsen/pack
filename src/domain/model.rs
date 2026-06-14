@@ -86,10 +86,8 @@ pub struct OperatorBlock {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OperatorTerminalMode {
-    UniformWord = 0,
-    SmallPalette = 1,
-    SparseWordExceptions = 2,
-    RawTerminal = 3,
+    RawSeed = 0,
+    PaletteSeed = 1,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

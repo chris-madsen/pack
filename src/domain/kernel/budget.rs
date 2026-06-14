@@ -2,14 +2,21 @@
 pub struct BitBudget {
     pub source_bits: u64,
     pub key_bits: u64,
-    pub crumb_bits: u64,
+    pub seed_bits: u64,
+    pub branch_bits: u64,
     pub overhead_bits: u64,
 }
 
 impl BitBudget {
+    pub fn payload_bits(&self) -> Result<u64, String> {
+        self.seed_bits
+            .checked_add(self.branch_bits)
+            .ok_or_else(|| "bit budget payload overflow".to_string())
+    }
+
     pub fn encoded_bits(&self) -> Result<u64, String> {
         self.key_bits
-            .checked_add(self.crumb_bits)
+            .checked_add(self.payload_bits()?)
             .and_then(|value| value.checked_add(self.overhead_bits))
             .ok_or_else(|| "bit budget overflow".to_string())
     }
@@ -22,7 +29,7 @@ impl BitBudget {
         if self.source_bits == 0 {
             return Err("source bit length must be non-zero".to_string());
         }
-        Ok(self.crumb_bits as f64 / self.source_bits as f64)
+        Ok(self.payload_bits()? as f64 / self.source_bits as f64)
     }
 }
 
@@ -92,7 +99,8 @@ mod tests {
         let budget = BitBudget {
             source_bits: 4096,
             key_bits: 256,
-            crumb_bits: 3000,
+            seed_bits: 1200,
+            branch_bits: 1800,
             overhead_bits: 64,
         };
         assert_eq!(budget.encoded_bits().unwrap(), 3320);
@@ -107,7 +115,8 @@ mod tests {
             .accepts(BitBudget {
                 source_bits: 4096,
                 key_bits: 256,
-                crumb_bits: 3776,
+                seed_bits: 2000,
+                branch_bits: 1776,
                 overhead_bits: 64,
             })
             .unwrap());
@@ -115,7 +124,8 @@ mod tests {
             .accepts(BitBudget {
                 source_bits: 4096,
                 key_bits: 64,
-                crumb_bits: 3960,
+                seed_bits: 2000,
+                branch_bits: 1960,
                 overhead_bits: 64,
             })
             .unwrap());
@@ -128,7 +138,8 @@ mod tests {
             .accepts(BitBudget {
                 source_bits: 4096,
                 key_bits: 65,
-                crumb_bits: 1,
+                seed_bits: 1,
+                branch_bits: 0,
                 overhead_bits: 1,
             })
             .unwrap());
@@ -136,7 +147,8 @@ mod tests {
             .accepts(BitBudget {
                 source_bits: 1024,
                 key_bits: 65,
-                crumb_bits: 1,
+                seed_bits: 1,
+                branch_bits: 0,
                 overhead_bits: 1,
             })
             .unwrap());
@@ -152,7 +164,8 @@ mod tests {
             .accepts(BitBudget {
                 source_bits: 1024,
                 key_bits: 128,
-                crumb_bits: 832,
+                seed_bits: 400,
+                branch_bits: 432,
                 overhead_bits: 64,
             })
             .unwrap());
