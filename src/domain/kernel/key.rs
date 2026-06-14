@@ -5,8 +5,8 @@ pub const MAX_SPECTRAL_BITS: usize = 1 << 13;
 const SPECTRAL_INDEX_BITS: u64 = 13;
 const SPECTRAL_AMPLITUDE_BITS: u64 = 5;
 const TRAJECTORY_STEP_BITS: u64 = 6;
-const PACKED_CONSTANT_VERSION: u8 = 1;
-const PACKED_CONSTANT_FIXED_BYTES: usize = 26;
+const PACKED_CONSTANT_VERSION: u8 = 2;
+const PACKED_CONSTANT_FIXED_BYTES: usize = 35;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConstantFamily {
@@ -37,6 +37,8 @@ pub struct ConstantLayout {
     pub branch_span: u8,
     pub phase_mask: u64,
     pub odd_multiplier: u64,
+    pub dominant_walsh_mask: u64,
+    pub dominant_walsh_bias: bool,
     pub affine_mask: Option<u64>,
 }
 
@@ -61,6 +63,8 @@ impl PackedConstantK {
         bytes.push(layout.branch_span);
         bytes.extend_from_slice(&layout.phase_mask.to_le_bytes());
         bytes.extend_from_slice(&layout.odd_multiplier.to_le_bytes());
+        bytes.extend_from_slice(&layout.dominant_walsh_mask.to_le_bytes());
+        bytes.push(u8::from(layout.dominant_walsh_bias));
         if let Some(mask) = layout.affine_mask {
             bytes.extend_from_slice(&mask.to_le_bytes());
         }
@@ -116,6 +120,12 @@ impl PackedConstantK {
             branch_span: self.bytes[9],
             phase_mask: parse_u64(&self.bytes[10..18])?,
             odd_multiplier: parse_u64(&self.bytes[18..26])?,
+            dominant_walsh_mask: parse_u64(&self.bytes[26..34])?,
+            dominant_walsh_bias: match self.bytes[34] {
+                0 => false,
+                1 => true,
+                _ => return Err("dominant Walsh bias must be encoded as zero or one".to_string()),
+            },
             affine_mask,
         };
         validate_constant_layout(&layout)?;
@@ -356,6 +366,12 @@ fn validate_constant_layout(layout: &ConstantLayout) -> Result<(), String> {
     if layout.odd_multiplier & 1 == 0 {
         return Err("odd multiplier must stay odd".to_string());
     }
+    if layout.dominant_walsh_mask == 0 {
+        return Err("dominant Walsh mask must be non-zero".to_string());
+    }
+    if u32::from(layout.branch_rounds) > layout.dominant_walsh_mask.count_ones() {
+        return Err("branch rounds exceed the independent pivots in the Walsh mask".to_string());
+    }
     match layout.family {
         ConstantFamily::PhaseXor => {
             if layout.affine_mask.is_some() {
@@ -410,6 +426,8 @@ mod tests {
             branch_span: 17,
             phase_mask: 0x6996_0579_31EE_C0DE,
             odd_multiplier: 0x9E37_79B9_7F4A_7C15,
+            dominant_walsh_mask: 0x8080_8080_8080_8080,
+            dominant_walsh_bias: false,
             affine_mask: Some(0xA5A5_5A5A_C3C3_3C3C),
         }
     }

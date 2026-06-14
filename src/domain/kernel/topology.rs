@@ -36,6 +36,13 @@ pub struct ShiftScore {
     pub matching_bits: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WordParityFeature {
+    pub mask: u64,
+    pub bias: bool,
+    pub matching_words: usize,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TopologySignature {
     pub bit_len: usize,
@@ -43,6 +50,7 @@ pub struct TopologySignature {
     pub shift_scores: Vec<ShiftScore>,
     pub derivative: Vec<u8>,
     pub popcnt_profile: Vec<u8>,
+    pub word_parity: WordParityFeature,
 }
 
 #[cfg(test)]
@@ -164,6 +172,7 @@ pub fn analyze_topology(bytes: &[u8]) -> Result<TopologySignature, String> {
         shift_scores,
         derivative: circular_bit_derivative(&bits, 1)?,
         popcnt_profile: popcnt_profile(bytes, 8)?,
+        word_parity: strongest_word_parity_feature(bytes)?,
     })
 }
 
@@ -225,7 +234,7 @@ pub fn compile_topology_to_constant(
     let shift0 = signature.shift_scores[0].shift.max(1);
     let peak_gap = peak0.abs_diff(peak1).max(1);
     let word_count = (window_bits / 64).max(1);
-    let branch_rounds = ((dominance + shift_coherence) / 256).clamp(2, 12) as u8;
+    let branch_rounds = signature.word_parity.mask.count_ones().clamp(1, 16) as u8;
     let phase_mask = phase_mask_from_signature(signature);
     let affine_mask = affine_mask_from_signature(signature);
     let odd_multiplier = odd_multiplier_from_signature(signature);
@@ -243,11 +252,51 @@ pub fn compile_topology_to_constant(
         branch_span: (((signature.popcnt_profile.len() + shift0) % 31) + 1) as u8,
         phase_mask,
         odd_multiplier,
+        dominant_walsh_mask: signature.word_parity.mask,
+        dominant_walsh_bias: signature.word_parity.bias,
         affine_mask: match family {
             ConstantFamily::PhaseXor => None,
             ConstantFamily::OddAffine | ConstantFamily::Hybrid => Some(affine_mask),
         },
     })
+}
+
+fn strongest_word_parity_feature(bytes: &[u8]) -> Result<WordParityFeature, String> {
+    if bytes.is_empty() || bytes.len() % 8 != 0 {
+        return Err("word parity analysis requires complete 64-bit words".to_string());
+    }
+    let words = bytes
+        .chunks_exact(8)
+        .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
+        .collect::<Vec<_>>();
+    let mut masks = (0..64).map(|bit| 1_u64 << bit).collect::<Vec<_>>();
+    masks.extend((0..8).map(|bit| 0x0101_0101_0101_0101_u64 << bit));
+    masks.sort_unstable();
+    masks.dedup();
+
+    masks
+        .into_iter()
+        .filter(|mask| *mask != 0)
+        .map(|mask| {
+            let ones = words
+                .iter()
+                .filter(|word| (**word & mask).count_ones() & 1 == 1)
+                .count();
+            let zeros = words.len() - ones;
+            WordParityFeature {
+                mask,
+                bias: ones > zeros,
+                matching_words: ones.max(zeros),
+            }
+        })
+        .max_by_key(|feature| {
+            (
+                feature.matching_words,
+                feature.mask.count_ones(),
+                std::cmp::Reverse(feature.mask),
+            )
+        })
+        .ok_or_else(|| "word parity analysis produced no candidate mask".to_string())
 }
 
 pub fn compile_spectral_key(signature: &TopologySignature) -> Result<MagicKey, String> {
@@ -820,6 +869,18 @@ mod tests {
                 .count()
                 .min(MAX_SPECTRAL_PEAKS)
         );
+    }
+
+    #[test]
+    fn word_local_parity_feature_is_propagated_into_the_runtime_key() {
+        let input = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/".repeat(8);
+        let signature = analyze_topology(&input).unwrap();
+        assert_eq!(signature.word_parity.matching_words, input.len() / 8);
+        let packed = compile_topology_to_constant(&signature, input.len() * 8).unwrap();
+        let layout = packed.layout().unwrap();
+        assert_eq!(layout.dominant_walsh_mask, signature.word_parity.mask);
+        assert_eq!(layout.dominant_walsh_bias, signature.word_parity.bias);
+        assert!(u32::from(layout.branch_rounds) <= layout.dominant_walsh_mask.count_ones());
     }
 
     #[test]

@@ -520,40 +520,6 @@ fn satisfies_strict_generator_budget(encoded_bits: u64, source_len_bytes: usize)
         .is_some_and(|value| value < (source_len_bytes * 8) as u64)
 }
 
-fn select_block_window(input: &[u8], sizes: &[usize]) -> Result<(u8, usize), String> {
-    let mut best: Option<(u8, usize, f64)> = None;
-    for (index, &size) in sizes.iter().enumerate() {
-        let Some(block) = input.get(..size) else {
-            continue;
-        };
-        let score = match analyze_topology(block) {
-            Ok(signature) => topology_score(&signature),
-            Err(_) => continue,
-        };
-        let candidate = (index as u8, size, score);
-        let should_replace = best
-            .as_ref()
-            .map(|(_, best_size, best_score)| {
-                candidate.2 > *best_score
-                    || (candidate.2 == *best_score && candidate.1 > *best_size)
-            })
-            .unwrap_or(true);
-        if should_replace {
-            best = Some(candidate);
-        }
-    }
-    if let Some((index, size, _)) = best {
-        return Ok((index, size));
-    }
-    Ok((
-        0,
-        input
-            .len()
-            .min(*sizes.first().unwrap_or(&input.len()))
-            .max(1),
-    ))
-}
-
 /// Score a topology signature for window-size selection.
 /// Returns 0.0 for degenerate inputs (empty walsh_peaks) rather than panicking.
 fn topology_score(signature: &TopologySignature) -> f64 {
@@ -700,16 +666,7 @@ fn compress_single_layer_bytes_with_profile(
     let mut offset = 0_usize;
     while offset < input.len() {
         let (window_index, encoding, block_size) = match profile {
-            CompressionProfile::General => {
-                let (window_index, block_size) =
-                    select_block_window(&input[offset..], &block_sizes)?;
-                let block = &input[offset..offset + block_size];
-                (
-                    window_index,
-                    encode_block_with_profile(block, profile)?,
-                    block_size,
-                )
-            }
+            CompressionProfile::General => select_general_block(&input[offset..], &block_sizes)?,
             CompressionProfile::StrictGeneratorOnly => {
                 select_strict_generator_block(&input[offset..], &block_sizes)?
             }
@@ -736,6 +693,44 @@ fn compress_single_layer_bytes_with_profile(
         band,
         output: serialize_single_layer_archive(&archive)?,
     })
+}
+
+fn select_general_block(
+    input: &[u8],
+    sizes: &[usize],
+) -> Result<(u8, BlockEncoding, usize), String> {
+    let mut best: Option<(u8, BlockEncoding, usize, usize)> = None;
+    for (index, size) in sizes.iter().copied().enumerate() {
+        let Some(block) = input.get(..size) else {
+            continue;
+        };
+        let encoding = encode_block_with_profile(block, CompressionProfile::General)?;
+        let encoded_size = encoded_size_of(&encoding);
+        let should_replace = best
+            .as_ref()
+            .map(|(_, _, best_size, best_encoded_size)| {
+                encoded_size.saturating_mul(*best_size) < best_encoded_size.saturating_mul(size)
+                    || (encoded_size.saturating_mul(*best_size)
+                        == best_encoded_size.saturating_mul(size)
+                        && size > *best_size)
+            })
+            .unwrap_or(true);
+        if should_replace {
+            best = Some((index as u8, encoding, size, encoded_size));
+        }
+    }
+    Ok(best
+        .map(|(index, encoding, size, _)| (index, encoding, size))
+        .unwrap_or_else(|| {
+            (
+                0,
+                BlockEncoding::Raw(RawBlock {
+                    original_len: input.len() as u32,
+                    payload: input.to_vec(),
+                }),
+                input.len().max(1),
+            )
+        }))
 }
 
 fn select_strict_generator_block(
@@ -1057,7 +1052,10 @@ fn try_encode_operator_block(
     let steps = runtime.layout.branch_rounds;
     let (seed, branches) = contract_block(&runtime, block)?;
     let policy = match profile {
-        CompressionProfile::General => CompressionPolicy::MVP,
+        CompressionProfile::General => CompressionPolicy {
+            max_key_bits: u64::MAX,
+            ..CompressionPolicy::MVP
+        },
         CompressionProfile::StrictGeneratorOnly => CompressionPolicy {
             max_key_bits: u64::MAX,
             minimum_gain_fraction: STRICT_GENERATOR_GAIN_FRACTION,
@@ -1367,13 +1365,6 @@ fn decode_operator_block(block: &OperatorBlock) -> Result<Vec<u8>, String> {
         return Err("strict operator decoder gas limit exceeded".to_string());
     }
     validate_operator_seed_payload(block)?;
-    let expected_branch_bytes = ceil_div_u64(
-        (runtime.word_count * runtime.layout.branch_rounds as usize) as u64,
-        8,
-    ) as usize;
-    if block.breadcrumbs.len() != expected_branch_bytes {
-        return Err("strict operator branch-log byte length is not canonical".to_string());
-    }
     let restored = expand_block(&runtime, &block.terminal_payload, &block.breadcrumbs)?;
     let (canonical_seed, canonical_branches) = contract_block(&runtime, &restored)?;
     if canonical_branches != block.breadcrumbs {
@@ -1999,16 +1990,7 @@ fn parse_archive(input: &[u8]) -> Result<Archive, String> {
                     terminal_mode,
                     terminal_payload,
                 };
-                let runtime = decode_operator_runtime(&block)?;
-                let expected_branch_bytes = ceil_div_u64(
-                    (runtime.word_count * runtime.layout.branch_rounds as usize) as u64,
-                    8,
-                ) as usize;
-                if block.breadcrumbs.len() != expected_branch_bytes {
-                    return Err(
-                        "strict operator branch-log byte length is not canonical".to_string()
-                    );
-                }
+                decode_operator_runtime(&block)?;
                 validate_operator_seed_payload(&block)?;
                 BlockEncoding::Operator(block)
             }
@@ -2337,7 +2319,9 @@ mod compact_codec_tests {
 
         let mut changed_branch = block.clone();
         changed_branch.breadcrumbs[0] ^= 1;
-        assert_ne!(decode_operator_block(&changed_branch).unwrap(), input);
+        assert!(decode_operator_block(&changed_branch)
+            .map(|decoded| decoded != input)
+            .unwrap_or(true));
 
         let mut mismatched_rounds = block;
         mismatched_rounds.steps = mismatched_rounds.steps.saturating_add(1);
@@ -2503,6 +2487,11 @@ mod compact_codec_tests {
             shift_scores: vec![],
             derivative: vec![0u8; 64],
             popcnt_profile: vec![0u8; 8],
+            word_parity: crate::domain::kernel::topology::WordParityFeature {
+                mask: 1,
+                bias: false,
+                matching_words: 1,
+            },
         };
         assert_eq!(topology_score(&sig), 0.0);
     }

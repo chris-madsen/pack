@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::domain::bitstream::{bit_width_for_cardinality, pack_indices, unpack_indices};
-use crate::domain::kernel::key::{ConstantFamily, ConstantLayout, PackedConstantK, RoutingKind};
+use crate::domain::kernel::key::{ConstantLayout, PackedConstantK};
 use crate::domain::kernel::reversible::{
     feistel_forward, feistel_inverse, FeistelKey, FeistelRoundKey,
 };
@@ -12,6 +12,8 @@ use crate::domain::kernel::topology::parse_strict_key_layout;
 pub const OPERATOR_BLOCK_WORDS: usize = 64;
 const SEED_MODE_RAW: u8 = 0;
 const SEED_MODE_PALETTE: u8 = 1;
+const BRANCH_MODE_DENSE: u8 = 0;
+const BRANCH_MODE_SPARSE: u8 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct IndexMix {
@@ -107,7 +109,6 @@ pub fn contract_block(
         .chunks_exact(8)
         .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
         .collect::<Vec<_>>();
-    apply_fixed_pipeline_forward(&mut words, &runtime.layout);
     let mut live_bits = 64_usize;
     let mut branches =
         Vec::with_capacity(runtime.word_count * runtime.layout.branch_rounds as usize);
@@ -115,16 +116,16 @@ pub fn contract_block(
         if live_bits <= 1 {
             return Err("branch contraction exhausted the word width".to_string());
         }
-        for (index, word) in words.iter_mut().enumerate() {
-            let geometry = branch_geometry(&runtime.layout, index, round, live_bits);
-            let branch = parity(*word & geometry.full_mask) == 1;
-            branches.push(branch);
+        let geometry = branch_geometry(&runtime.layout, round, live_bits)?;
+        for word in &mut words {
+            let actual_parity = parity(*word & geometry.full_mask) == 1;
+            branches.push(actual_parity != runtime.layout.dominant_walsh_bias);
             *word = remove_bit_at(*word, geometry.pivot) & word_mask(live_bits - 1);
         }
         live_bits -= 1;
     }
     let seed = encode_terminal_seed(&words, live_bits)?;
-    Ok((seed, pack_bools_local(&branches)))
+    Ok((seed, encode_branch_log(&branches)))
 }
 
 pub fn expand_block(
@@ -133,21 +134,22 @@ pub fn expand_block(
     branches: &[u8],
 ) -> Result<Vec<u8>, String> {
     let total_branch_bits = runtime.word_count * runtime.layout.branch_rounds as usize;
-    let crumbs = unpack_bools_local(branches, total_branch_bits)?;
+    let crumbs = decode_branch_log(branches, total_branch_bits)?;
     let final_live_bits = 64 - runtime.layout.branch_rounds as usize;
     let mut words = decode_terminal_seed(seed, runtime.word_count, final_live_bits)?;
     let mut cursor = crumbs.len();
     let mut live_bits = final_live_bits;
     for round in (0..runtime.layout.branch_rounds as usize).rev() {
         live_bits += 1;
+        let geometry = branch_geometry(&runtime.layout, round, live_bits)?;
         for index in (0..words.len()).rev() {
             cursor = cursor
                 .checked_sub(1)
                 .ok_or_else(|| "branch log underflow".to_string())?;
-            let geometry = branch_geometry(&runtime.layout, index, round, live_bits);
             let reduced_mask = remove_bit_at(geometry.full_mask, geometry.pivot);
-            let branch = u8::from(crumbs[cursor]);
-            let pivot = (branch ^ parity(words[index] & reduced_mask)) == 1;
+            let expected_parity =
+                u8::from(runtime.layout.dominant_walsh_bias) ^ u8::from(crumbs[cursor]);
+            let pivot = (expected_parity ^ parity(words[index] & reduced_mask)) == 1;
             words[index] =
                 insert_bit_at(words[index], geometry.pivot, pivot) & word_mask(live_bits);
         }
@@ -155,7 +157,6 @@ pub fn expand_block(
     if cursor != 0 {
         return Err("branch log contains trailing bits".to_string());
     }
-    apply_fixed_pipeline_inverse(&mut words, &runtime.layout)?;
     Ok(words.into_iter().flat_map(u64::to_le_bytes).collect())
 }
 
@@ -384,95 +385,6 @@ pub fn default_feistel_from_seed(seed: u64, rounds: u8) -> FeistelKey {
     FeistelKey { rounds: keys }
 }
 
-fn apply_fixed_pipeline_forward(words: &mut [u64], layout: &ConstantLayout) {
-    apply_routing_forward(words, layout);
-    if layout.routing == RoutingKind::Butterfly {
-        apply_slice_butterfly_forward(words);
-    }
-    for (index, word) in words.iter_mut().enumerate() {
-        *word = word_forward_mix(*word, layout, index);
-    }
-}
-
-fn apply_fixed_pipeline_inverse(words: &mut [u64], layout: &ConstantLayout) -> Result<(), String> {
-    for (index, word) in words.iter_mut().enumerate() {
-        *word = word_inverse_mix(*word, layout, index)?;
-    }
-    if layout.routing == RoutingKind::Butterfly {
-        apply_slice_butterfly_inverse(words);
-    }
-    apply_routing_inverse(words, layout);
-    Ok(())
-}
-
-fn word_forward_mix(mut value: u64, layout: &ConstantLayout, word_index: usize) -> u64 {
-    let phase_mask = per_word_mask(layout.phase_mask, word_index, layout.rotate_right);
-    value ^= phase_mask;
-    value = value.rotate_left(layout.rotate_left as u32);
-    value = value.wrapping_mul(layout.odd_multiplier);
-    value = value.rotate_right(layout.rotate_right as u32);
-    value = gf2_right_mix_forward(value, layout.gf2_shift);
-    if let Some(mask) = layout.affine_mask {
-        value ^= per_word_mask(mask, word_index, layout.rotate_left);
-    }
-    match layout.family {
-        ConstantFamily::PhaseXor => value,
-        ConstantFamily::OddAffine => {
-            value.rotate_left(((word_index + usize::from(layout.lane_rotate)) % 63 + 1) as u32)
-        }
-        ConstantFamily::Hybrid => value ^ phase_mask.rotate_right(layout.rotate_right as u32),
-    }
-}
-
-fn word_inverse_mix(
-    mut value: u64,
-    layout: &ConstantLayout,
-    word_index: usize,
-) -> Result<u64, String> {
-    let phase_mask = per_word_mask(layout.phase_mask, word_index, layout.rotate_right);
-    value = match layout.family {
-        ConstantFamily::PhaseXor => value,
-        ConstantFamily::OddAffine => {
-            value.rotate_right(((word_index + usize::from(layout.lane_rotate)) % 63 + 1) as u32)
-        }
-        ConstantFamily::Hybrid => value ^ phase_mask.rotate_right(layout.rotate_right as u32),
-    };
-    if let Some(mask) = layout.affine_mask {
-        value ^= per_word_mask(mask, word_index, layout.rotate_left);
-    }
-    value = gf2_right_mix_inverse(value, layout.gf2_shift);
-    value = value.rotate_left(layout.rotate_right as u32);
-    value = value.wrapping_mul(mod_inverse_odd_u64(layout.odd_multiplier));
-    value = value.rotate_right(layout.rotate_left as u32);
-    Ok(value ^ phase_mask)
-}
-
-fn apply_routing_forward(words: &mut [u64], layout: &ConstantLayout) {
-    if words.is_empty() {
-        return;
-    }
-    match layout.routing {
-        RoutingKind::Identity | RoutingKind::Butterfly => {}
-        RoutingKind::RotateWords => {
-            words.rotate_left(usize::from(layout.lane_rotate) % words.len())
-        }
-        RoutingKind::ReverseWords => words.reverse(),
-    }
-}
-
-fn apply_routing_inverse(words: &mut [u64], layout: &ConstantLayout) {
-    if words.is_empty() {
-        return;
-    }
-    match layout.routing {
-        RoutingKind::Identity | RoutingKind::Butterfly => {}
-        RoutingKind::RotateWords => {
-            words.rotate_right(usize::from(layout.lane_rotate) % words.len())
-        }
-        RoutingKind::ReverseWords => words.reverse(),
-    }
-}
-
 fn apply_slice_butterfly_forward(words: &mut [u64]) {
     if words.len() < 2 || !words.len().is_power_of_two() {
         return;
@@ -672,35 +584,37 @@ fn slice_cnot_stage(words: &mut [u64], half_width: usize) {
 
 fn branch_geometry(
     layout: &ConstantLayout,
-    word_index: usize,
     round: usize,
     live_bits: usize,
-) -> BranchGeometry {
-    let pivot = (usize::from(layout.pivot_seed)
-        + word_index * usize::from(layout.branch_stride)
-        + round * usize::from(layout.branch_span))
-        % live_bits.max(1);
-    let mut mask = layout
-        .phase_mask
-        .rotate_left(((word_index + round) % 64) as u32)
-        ^ repeat_byte(layout.branch_stride ^ layout.branch_span).rotate_right(
-            ((word_index * (round + 1) + usize::from(layout.rotate_right)) % 64) as u32,
-        );
-    if let Some(affine_mask) = layout.affine_mask {
-        mask ^= affine_mask.rotate_left(((round + usize::from(layout.lane_rotate)) % 64) as u32);
+) -> Result<BranchGeometry, String> {
+    let mut mask = layout.dominant_walsh_mask;
+    let mut width = 64_usize;
+    for _ in 0..round {
+        mask &= word_mask(width);
+        if mask == 0 {
+            return Err("dominant Walsh mask exhausted before all branch rounds".to_string());
+        }
+        let pivot = mask.trailing_zeros() as usize;
+        mask = remove_bit_at(mask, pivot);
+        width -= 1;
     }
     mask &= word_mask(live_bits);
-    mask |= 1_u64 << pivot;
-    BranchGeometry {
+    if mask == 0 {
+        return Err("dominant Walsh mask has no live pivot".to_string());
+    }
+    let pivot = mask.trailing_zeros() as usize;
+    Ok(BranchGeometry {
         pivot,
         full_mask: mask,
-    }
+    })
 }
 
+#[cfg(test)]
 fn gf2_right_mix_forward(value: u64, shift: u8) -> u64 {
     value ^ (value >> shift)
 }
 
+#[cfg(test)]
 fn gf2_right_mix_inverse(mut value: u64, shift: u8) -> u64 {
     let mut delta = usize::from(shift);
     while delta < 64 {
@@ -710,16 +624,13 @@ fn gf2_right_mix_inverse(mut value: u64, shift: u8) -> u64 {
     value
 }
 
+#[cfg(test)]
 fn mod_inverse_odd_u64(value: u64) -> u64 {
     let mut inverse = 1_u64;
     for _ in 0..6 {
         inverse = inverse.wrapping_mul(2_u64.wrapping_sub(value.wrapping_mul(inverse)));
     }
     inverse
-}
-
-fn per_word_mask(mask: u64, word_index: usize, rotate_hint: u8) -> u64 {
-    mask.rotate_left(((word_index * (usize::from(rotate_hint) + 1)) % 64) as u32)
 }
 
 fn encode_terminal_seed(words: &[u64], live_bits: usize) -> Result<Vec<u8>, String> {
@@ -869,10 +780,15 @@ fn insert_bit_at(value: u64, position: usize, bit: bool) -> u64 {
 }
 
 fn pack_words_with_width(words: &[u64], live_bits: usize) -> Vec<u8> {
-    let bytes_per_word = live_bits.div_ceil(8);
-    let mut out = Vec::with_capacity(words.len() * bytes_per_word);
+    let mut out = vec![0_u8; (words.len() * live_bits).div_ceil(8)];
+    let mut cursor = 0_usize;
     for word in words {
-        out.extend_from_slice(&word.to_le_bytes()[..bytes_per_word]);
+        let value = *word & word_mask(live_bits);
+        for bit_index in 0..live_bits {
+            let bit = ((value >> bit_index) & 1) as u8;
+            out[cursor / 8] |= bit << (cursor % 8);
+            cursor += 1;
+        }
     }
     out
 }
@@ -882,18 +798,30 @@ fn unpack_words_with_width(
     word_count: usize,
     live_bits: usize,
 ) -> Result<Vec<u64>, String> {
-    let bytes_per_word = live_bits.div_ceil(8);
-    let expected = word_count
-        .checked_mul(bytes_per_word)
+    let total_bits = word_count
+        .checked_mul(live_bits)
         .ok_or_else(|| "seed length overflow".to_string())?;
+    let expected = total_bits.div_ceil(8);
     if bytes.len() != expected {
         return Err("seed length does not match the live word width".to_string());
     }
+    if total_bits % 8 != 0
+        && bytes
+            .last()
+            .is_some_and(|byte| byte >> (total_bits % 8) != 0)
+    {
+        return Err("seed contains non-zero padding bits".to_string());
+    }
     let mut words = Vec::with_capacity(word_count);
-    for chunk in bytes.chunks_exact(bytes_per_word) {
-        let mut encoded = [0_u8; 8];
-        encoded[..bytes_per_word].copy_from_slice(chunk);
-        words.push(u64::from_le_bytes(encoded) & word_mask(live_bits));
+    let mut cursor = 0_usize;
+    for _ in 0..word_count {
+        let mut word = 0_u64;
+        for bit_index in 0..live_bits {
+            let bit = (bytes[cursor / 8] >> (cursor % 8)) & 1;
+            word |= u64::from(bit) << bit_index;
+            cursor += 1;
+        }
+        words.push(word);
     }
     Ok(words)
 }
@@ -908,16 +836,115 @@ fn pack_bools_local(bits: &[bool]) -> Vec<u8> {
     out
 }
 
+fn encode_branch_log(bits: &[bool]) -> Vec<u8> {
+    let dense_payload = pack_bools_local(bits);
+    let mut dense = Vec::with_capacity(1 + dense_payload.len());
+    dense.push(BRANCH_MODE_DENSE);
+    dense.extend_from_slice(&dense_payload);
+
+    let mut sparse = vec![BRANCH_MODE_SPARSE];
+    let mut previous = None;
+    for position in bits
+        .iter()
+        .enumerate()
+        .filter_map(|(index, bit)| bit.then_some(index))
+    {
+        let delta = previous.map_or(position + 1, |last| position - last);
+        encode_uleb128_local(delta as u64, &mut sparse);
+        previous = Some(position);
+    }
+    if sparse.len() < dense.len() {
+        sparse
+    } else {
+        dense
+    }
+}
+
+fn decode_branch_log(bytes: &[u8], count: usize) -> Result<Vec<bool>, String> {
+    let Some((&mode, payload)) = bytes.split_first() else {
+        return Err("branch log is empty".to_string());
+    };
+    let bits = match mode {
+        BRANCH_MODE_DENSE => unpack_bools_local(payload, count)?,
+        BRANCH_MODE_SPARSE => {
+            let mut bits = vec![false; count];
+            let mut cursor = 0_usize;
+            let mut previous = None;
+            while cursor < payload.len() {
+                let delta = decode_uleb128_local(payload, &mut cursor)?;
+                if delta == 0 {
+                    return Err("sparse branch delta must be positive".to_string());
+                }
+                let position = previous.map_or(delta as usize - 1, |last| last + delta as usize);
+                if position >= count {
+                    return Err("sparse branch position is outside the branch log".to_string());
+                }
+                bits[position] = true;
+                previous = Some(position);
+            }
+            bits
+        }
+        _ => return Err("branch log encoding mode is unknown".to_string()),
+    };
+    if encode_branch_log(&bits) != bytes {
+        return Err("branch log encoding is not canonical".to_string());
+    }
+    Ok(bits)
+}
+
+fn encode_uleb128_local(mut value: u64, out: &mut Vec<u8>) {
+    loop {
+        let mut byte = (value & 0x7F) as u8;
+        value >>= 7;
+        if value != 0 {
+            byte |= 0x80;
+        }
+        out.push(byte);
+        if value == 0 {
+            break;
+        }
+    }
+}
+
+fn decode_uleb128_local(bytes: &[u8], cursor: &mut usize) -> Result<u64, String> {
+    let start = *cursor;
+    let mut value = 0_u64;
+    let mut shift = 0_u32;
+    loop {
+        let byte = *bytes
+            .get(*cursor)
+            .ok_or_else(|| "truncated sparse branch delta".to_string())?;
+        *cursor += 1;
+        if shift >= 64 {
+            return Err("sparse branch delta overflow".to_string());
+        }
+        value |= u64::from(byte & 0x7F) << shift;
+        if byte & 0x80 == 0 {
+            let mut canonical = Vec::new();
+            encode_uleb128_local(value, &mut canonical);
+            if canonical.as_slice() != &bytes[start..*cursor] {
+                return Err("sparse branch delta is not canonical".to_string());
+            }
+            return Ok(value);
+        }
+        shift += 7;
+    }
+}
+
 fn unpack_bools_local(bytes: &[u8], count: usize) -> Result<Vec<bool>, String> {
     let expected = count.div_ceil(8);
     if bytes.len() != expected {
         return Err("branch-log length does not match the expected bit count".to_string());
+    }
+    if count % 8 != 0 && bytes.last().is_some_and(|byte| byte >> (count % 8) != 0) {
+        return Err("dense branch log contains non-zero padding bits".to_string());
     }
     Ok((0..count)
         .map(|index| ((bytes[index / 8] >> (index % 8)) & 1) == 1)
         .collect())
 }
 
+#[cfg(test)]
 fn repeat_byte(byte: u8) -> u64 {
     u64::from_le_bytes([byte; 8])
 }
@@ -959,9 +986,9 @@ mod tests {
     use super::{
         apply_binary_u_k, apply_block_butterfly_forward, apply_block_butterfly_inverse, apply_fk,
         apply_fk_inverse, apply_phase_reflection, apply_u_k, binary_hadamard_forward,
-        contract_block, default_feistel_from_seed, expand_block, materialize_runtime,
-        strongest_binary_word_peaks, BinaryOperatorKey, IndexMix, PhaseKey, SpectralOperatorKey,
-        OPERATOR_BLOCK_WORDS,
+        contract_block, decode_branch_log, default_feistel_from_seed, encode_branch_log,
+        expand_block, materialize_runtime, strongest_binary_word_peaks, BinaryOperatorKey,
+        IndexMix, PhaseKey, SpectralOperatorKey, BRANCH_MODE_SPARSE, OPERATOR_BLOCK_WORDS,
     };
     use crate::domain::kernel::key::{
         ConstantFamily, ConstantLayout, PackedConstantK, RoutingKind,
@@ -991,6 +1018,8 @@ mod tests {
             branch_span: 17,
             phase_mask: 0x6996_0579_31EE_C0DE,
             odd_multiplier: 0x9E37_79B9_7F4A_7C15,
+            dominant_walsh_mask: 0x8080_8080_8080_8080,
+            dominant_walsh_bias: false,
             affine_mask: Some(0xA5A5_5A5A_C3C3_3C3C),
         }
     }
@@ -1118,6 +1147,23 @@ mod tests {
         let (seed, branches) = contract_block(&runtime, &input).unwrap();
         let mut changed = branches.clone();
         changed[0] ^= 1;
-        assert_ne!(expand_block(&runtime, &seed, &changed).unwrap(), input);
+        assert!(expand_block(&runtime, &seed, &changed)
+            .map(|decoded| decoded != input)
+            .unwrap_or(true));
+    }
+
+    #[test]
+    fn sparse_branch_log_roundtrips_rare_anomalies_canonically() {
+        let mut bits = vec![false; 512];
+        bits[7] = true;
+        bits[311] = true;
+        let encoded = encode_branch_log(&bits);
+        assert_eq!(encoded[0], BRANCH_MODE_SPARSE);
+        assert!(encoded.len() < 1 + bits.len().div_ceil(8));
+        assert_eq!(decode_branch_log(&encoded, bits.len()).unwrap(), bits);
+
+        let mut non_canonical = encoded;
+        non_canonical.extend_from_slice(&[0]);
+        assert!(decode_branch_log(&non_canonical, bits.len()).is_err());
     }
 }
