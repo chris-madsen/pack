@@ -1,29 +1,32 @@
 use crate::domain::kernel::key::MagicKey;
-use crate::domain::kernel::key::{
-    ConstantFamily, ConstantLayout, PackedConstantK, RoutingKind, SpectralPeakCode,
-    SpectralProgram, MAX_SPECTRAL_PEAKS,
-};
+#[cfg(test)]
+use crate::domain::kernel::key::{ConstantFamily, ConstantLayout, PackedConstantK, RoutingKind};
+use crate::domain::kernel::key::{SpectralPeakCode, SpectralProgram, MAX_SPECTRAL_PEAKS};
 
 /// A Walsh dominance ratio ≥ this threshold (out of 1024) indicates that a
 /// single spectral peak accounts for ≥ 68% of total spectral energy. Empirically
 /// this correlates with structured (non-random) data that benefits from PhaseXor
 /// treatment. Values below 512 (~50%) were tested and produced worse round-trip
 /// compression ratios on structured byte streams.
+#[cfg(test)]
 const DOMINANCE_THRESHOLD: u64 = 700;
 
 /// Derivative bit-density ≤ this threshold (out of 1024) indicates low local
 /// variation — the signal changes direction infrequently. Combined with high
 /// dominance this is a reliable indicator of a phase-shift exploitable topology.
+#[cfg(test)]
 const DENSITY_THRESHOLD: u64 = 512;
 
 /// Shift-coherence ratio ≥ this threshold (out of 1024) means that more than
 /// 68% of bit positions match a shifted copy of themselves — a strong periodic
 /// structure. This triggers OddAffine treatment which exploits the periodicity.
+#[cfg(test)]
 const COHERENCE_THRESHOLD: u64 = 700;
 
 /// Minimum fraction of topology score above which the routing decision switches
 /// from Identity/RotateWords (low-coherence regime) to ReverseWords/Butterfly
 /// (high-coherence regime). Expressed as a fraction of 1024.
+#[cfg(test)]
 const ROUTING_COHERENCE_PIVOT: u64 = 600;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -167,6 +170,7 @@ pub fn analyze_topology(bytes: &[u8]) -> Result<TopologySignature, String> {
     })
 }
 
+#[cfg(test)]
 pub fn compile_topology_to_constant(
     signature: &TopologySignature,
     window_bits: usize,
@@ -432,6 +436,33 @@ pub fn compile_strict_operator_key(
     })
 }
 
+pub fn compile_strict_operator_steps(
+    signature: &TopologySignature,
+    window_bits: usize,
+) -> Result<u8, String> {
+    if signature.bit_len != window_bits {
+        return Err("signature bit length does not match the selected window".to_string());
+    }
+    if signature.walsh_peaks.is_empty() || signature.shift_scores.is_empty() {
+        return Err("signature lacks required topology features".to_string());
+    }
+    let dominance_total = signature
+        .walsh_peaks
+        .iter()
+        .map(|peak| peak.coefficient.unsigned_abs() as usize)
+        .sum::<usize>()
+        .max(1);
+    let dominance =
+        signature.walsh_peaks[0].coefficient.unsigned_abs() as usize * 1024 / dominance_total;
+    let derivative_ones = signature.derivative.iter().filter(|bit| **bit == 1).count();
+    let derivative_density = derivative_ones * 1024 / signature.derivative.len().max(1);
+    let shift_coherence = signature.shift_scores[0].matching_bits * 1024 / signature.bit_len.max(1);
+    let window_factor = (window_bits.ilog2().saturating_sub(7) as usize).min(3);
+    let structured = dominance / 192 + shift_coherence / 320 + window_factor;
+    let noisy = derivative_density / 256;
+    Ok(structured.saturating_sub(noisy).clamp(1, 8) as u8)
+}
+
 pub fn parse_strict_key_layout(bit_len: u16, bytes: &[u8]) -> Result<StrictKeyLayout, String> {
     let expected_bytes = (bit_len as usize).div_ceil(8);
     if bytes.len() != expected_bytes {
@@ -629,6 +660,7 @@ fn strongest_integer_walsh_peaks(spectrum: &[i32], count: usize) -> Vec<WalshPea
 /// Uses a different fold seed (0xC4CE_...) from affine_mask_from_signature
 /// (0xA3B1_...) so the two masks are not linearly correlated even when
 /// the popcnt_profile is uniform (all bytes identical).
+#[cfg(test)]
 fn phase_mask_from_signature(signature: &TopologySignature) -> u64 {
     signature
         .walsh_peaks
@@ -647,6 +679,7 @@ fn phase_mask_from_signature(signature: &TopologySignature) -> u64 {
 /// Uses a distinct initial rotation (rotate_left(11) vs phase_mask rotate_left(0))
 /// and a different mixing constant to ensure statistical independence from
 /// phase_mask even for uniform blocks.
+#[cfg(test)]
 fn affine_mask_from_signature(signature: &TopologySignature) -> u64 {
     let derivative_mask =
         signature
@@ -661,6 +694,7 @@ fn affine_mask_from_signature(signature: &TopologySignature) -> u64 {
         ^ repeat_popcnt_pattern_affine(&signature.popcnt_profile).rotate_right(11)
 }
 
+#[cfg(test)]
 fn odd_multiplier_from_signature(signature: &TopologySignature) -> u64 {
     let base = signature.walsh_peaks.iter().take(3).enumerate().fold(
         0x9E37_79B9_7F4A_7C15_u64,
@@ -675,6 +709,7 @@ fn odd_multiplier_from_signature(signature: &TopologySignature) -> u64 {
 
 /// Popcnt mixing for phase_mask: folds bytes using seed 0xC4CE_B9FE_1A85_EC53.
 /// Distinct from affine variant to avoid correlation.
+#[cfg(test)]
 fn repeat_popcnt_pattern_phase(profile: &[u8]) -> u64 {
     if profile.is_empty() {
         return 0;
@@ -689,6 +724,7 @@ fn repeat_popcnt_pattern_phase(profile: &[u8]) -> u64 {
 
 /// Popcnt mixing for affine_mask: folds bytes using seed 0xA3B1_7F2D_9E04_C865.
 /// Distinct from phase variant to avoid correlation.
+#[cfg(test)]
 fn repeat_popcnt_pattern_affine(profile: &[u8]) -> u64 {
     if profile.is_empty() {
         return 0;

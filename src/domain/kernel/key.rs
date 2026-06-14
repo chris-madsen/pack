@@ -5,9 +5,12 @@ pub const MAX_SPECTRAL_BITS: usize = 1 << 13;
 const SPECTRAL_INDEX_BITS: u64 = 13;
 const SPECTRAL_AMPLITUDE_BITS: u64 = 5;
 const TRAJECTORY_STEP_BITS: u64 = 6;
+#[cfg(test)]
 const PACKED_CONSTANT_VERSION: u8 = 1;
+#[cfg(test)]
 const PACKED_CONSTANT_FIXED_BYTES: usize = 26;
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConstantFamily {
     PhaseXor = 0,
@@ -15,6 +18,7 @@ pub enum ConstantFamily {
     Hybrid = 2,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RoutingKind {
     Identity = 0,
@@ -23,6 +27,7 @@ pub enum RoutingKind {
     Butterfly = 3,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ConstantLayout {
     pub family: ConstantFamily,
@@ -40,11 +45,13 @@ pub struct ConstantLayout {
     pub affine_mask: Option<u64>,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PackedConstantK {
     bytes: Vec<u8>,
 }
 
+#[cfg(test)]
 impl PackedConstantK {
     pub fn from_layout(layout: &ConstantLayout) -> Result<Self, String> {
         validate_constant_layout(layout)?;
@@ -315,6 +322,7 @@ fn parse_u64(bytes: &[u8]) -> Result<u64, String> {
     Ok(u64::from_le_bytes(encoded))
 }
 
+#[cfg(test)]
 fn parse_constant_family(raw: u8) -> Result<ConstantFamily, String> {
     match raw {
         0 => Ok(ConstantFamily::PhaseXor),
@@ -324,6 +332,7 @@ fn parse_constant_family(raw: u8) -> Result<ConstantFamily, String> {
     }
 }
 
+#[cfg(test)]
 fn parse_routing_kind(raw: u8) -> Result<RoutingKind, String> {
     match raw {
         0 => Ok(RoutingKind::Identity),
@@ -334,6 +343,7 @@ fn parse_routing_kind(raw: u8) -> Result<RoutingKind, String> {
     }
 }
 
+#[cfg(test)]
 fn validate_constant_layout(layout: &ConstantLayout) -> Result<(), String> {
     if !(1..=16).contains(&layout.branch_rounds) {
         return Err("branch round budget must be in 1..=16".to_string());

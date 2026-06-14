@@ -1,6 +1,9 @@
+#[cfg(test)]
 use std::collections::{BTreeMap, BTreeSet};
 
+#[cfg(test)]
 use crate::domain::bitstream::{bit_width_for_cardinality, pack_indices, unpack_indices};
+#[cfg(test)]
 use crate::domain::kernel::key::{ConstantFamily, ConstantLayout, PackedConstantK, RoutingKind};
 use crate::domain::kernel::reversible::{
     feistel_forward, feistel_inverse, FeistelKey, FeistelRoundKey,
@@ -9,7 +12,9 @@ use crate::domain::kernel::spectral::normalized_fwht;
 use crate::domain::kernel::topology::parse_strict_key_layout;
 
 pub const OPERATOR_BLOCK_WORDS: usize = 64;
+#[cfg(test)]
 const SEED_MODE_RAW: u8 = 0;
+#[cfg(test)]
 const SEED_MODE_PALETTE: u8 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -62,6 +67,7 @@ pub struct BinaryWordPeak {
     pub bias: u16,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimePipeline {
     pub layout: ConstantLayout,
@@ -69,12 +75,14 @@ pub struct RuntimePipeline {
     pub word_count: usize,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct BranchGeometry {
     pivot: usize,
     full_mask: u64,
 }
 
+#[cfg(test)]
 pub fn materialize_runtime(
     code: &PackedConstantK,
     window_bits: usize,
@@ -92,6 +100,7 @@ pub fn materialize_runtime(
     })
 }
 
+#[cfg(test)]
 pub fn contract_block(
     runtime: &RuntimePipeline,
     block: &[u8],
@@ -126,6 +135,7 @@ pub fn contract_block(
     Ok((seed, pack_bools_local(&branches)))
 }
 
+#[cfg(test)]
 pub fn expand_block(
     runtime: &RuntimePipeline,
     seed: &[u8],
@@ -288,6 +298,33 @@ pub fn apply_strict_operator_inverse_step(
     Ok(())
 }
 
+pub fn apply_strict_operator_schedule(
+    words: &mut [u64],
+    key_bits: u16,
+    key: &[u8],
+    steps: u8,
+) -> Result<Vec<u8>, String> {
+    if steps == 0 {
+        return Err("strict operator schedule requires at least one step".to_string());
+    }
+    let params = parse_strict_params(key_bits, key)?;
+    let mut breadcrumbs = Vec::with_capacity(words.len() * steps as usize);
+    for step in 0..steps {
+        breadcrumbs.extend(
+            words
+                .iter()
+                .enumerate()
+                .map(|(index, word)| strict_word_breadcrumb(*word, &params, index, step)),
+        );
+        words.rotate_left(params.lane_rotate % words.len());
+        apply_slice_butterfly_forward(words);
+        for (index, word) in words.iter_mut().enumerate() {
+            *word = strict_word_forward(*word, &params, index);
+        }
+    }
+    Ok(pack_bools_local(&breadcrumbs))
+}
+
 pub fn cnot_stage(mut value: u64, half_width: usize) -> u64 {
     let block_width = half_width * 2;
     for block_start in (0..64).step_by(block_width) {
@@ -353,6 +390,7 @@ pub fn default_feistel_from_seed(seed: u64, rounds: u8) -> FeistelKey {
     FeistelKey { rounds: keys }
 }
 
+#[cfg(test)]
 fn apply_fixed_pipeline_forward(words: &mut [u64], layout: &ConstantLayout) {
     apply_routing_forward(words, layout);
     if layout.routing == RoutingKind::Butterfly {
@@ -363,6 +401,7 @@ fn apply_fixed_pipeline_forward(words: &mut [u64], layout: &ConstantLayout) {
     }
 }
 
+#[cfg(test)]
 fn apply_fixed_pipeline_inverse(words: &mut [u64], layout: &ConstantLayout) -> Result<(), String> {
     for (index, word) in words.iter_mut().enumerate() {
         *word = word_inverse_mix(*word, layout, index)?;
@@ -374,6 +413,7 @@ fn apply_fixed_pipeline_inverse(words: &mut [u64], layout: &ConstantLayout) -> R
     Ok(())
 }
 
+#[cfg(test)]
 fn word_forward_mix(mut value: u64, layout: &ConstantLayout, word_index: usize) -> u64 {
     let phase_mask = per_word_mask(layout.phase_mask, word_index, layout.rotate_right);
     value ^= phase_mask;
@@ -393,6 +433,7 @@ fn word_forward_mix(mut value: u64, layout: &ConstantLayout, word_index: usize) 
     }
 }
 
+#[cfg(test)]
 fn word_inverse_mix(
     mut value: u64,
     layout: &ConstantLayout,
@@ -416,6 +457,7 @@ fn word_inverse_mix(
     Ok(value ^ phase_mask)
 }
 
+#[cfg(test)]
 fn apply_routing_forward(words: &mut [u64], layout: &ConstantLayout) {
     if words.is_empty() {
         return;
@@ -429,6 +471,7 @@ fn apply_routing_forward(words: &mut [u64], layout: &ConstantLayout) {
     }
 }
 
+#[cfg(test)]
 fn apply_routing_inverse(words: &mut [u64], layout: &ConstantLayout) {
     if words.is_empty() {
         return;
@@ -512,6 +555,35 @@ fn strict_phase_mask(seed: u64, parity_seed: u8, word_index: usize) -> u64 {
 fn strict_affine_mask(seed: u64, parity_seed: u8, word_index: usize) -> u64 {
     seed.rotate_right(((word_index * 11) % 64) as u32)
         ^ repeat_byte(parity_seed.wrapping_mul(17)).rotate_left(((word_index * 5) % 64) as u32)
+}
+
+fn strict_word_breadcrumb(
+    value: u64,
+    params: &StrictOperatorParams,
+    word_index: usize,
+    step: u8,
+) -> bool {
+    let phase = strict_phase_mask(
+        params.phase_seed.rotate_left((step as u32 * 13) % 64),
+        params.parity_seed ^ step,
+        word_index,
+    );
+    let affine = strict_affine_mask(
+        params.affine_seed.rotate_right((step as u32 * 7) % 64),
+        params.parity_seed.wrapping_add(step.wrapping_mul(3)),
+        word_index,
+    );
+    let conflict = phase
+        ^ affine
+        ^ repeat_byte(
+            params
+                .shift_alpha
+                .wrapping_add(params.shift_beta)
+                .wrapping_add(params.rotate_alpha)
+                .wrapping_add(params.rotate_beta)
+                .wrapping_add(step),
+        );
+    parity(value & conflict) == 1
 }
 
 fn parse_strict_params(key_bits: u16, key: &[u8]) -> Result<StrictOperatorParams, String> {
@@ -601,6 +673,7 @@ fn slice_cnot_stage(words: &mut [u64], half_width: usize) {
     }
 }
 
+#[cfg(test)]
 fn branch_geometry(
     layout: &ConstantLayout,
     word_index: usize,
@@ -649,10 +722,12 @@ fn mod_inverse_odd_u64(value: u64) -> u64 {
     inverse
 }
 
+#[cfg(test)]
 fn per_word_mask(mask: u64, word_index: usize, rotate_hint: u8) -> u64 {
     mask.rotate_left(((word_index * (usize::from(rotate_hint) + 1)) % 64) as u32)
 }
 
+#[cfg(test)]
 fn encode_terminal_seed(words: &[u64], live_bits: usize) -> Result<Vec<u8>, String> {
     let raw_payload = pack_words_with_width(words, live_bits);
     let raw = std::iter::once(SEED_MODE_RAW)
@@ -702,6 +777,7 @@ fn encode_terminal_seed(words: &[u64], live_bits: usize) -> Result<Vec<u8>, Stri
     })
 }
 
+#[cfg(test)]
 fn decode_terminal_seed(
     seed: &[u8],
     word_count: usize,
@@ -717,6 +793,7 @@ fn decode_terminal_seed(
     }
 }
 
+#[cfg(test)]
 fn decode_palette_seed(
     seed: &[u8],
     word_count: usize,
@@ -758,6 +835,7 @@ fn decode_palette_seed(
         .collect()
 }
 
+#[cfg(test)]
 fn word_mask(live_bits: usize) -> u64 {
     if live_bits >= 64 {
         u64::MAX
@@ -768,6 +846,7 @@ fn word_mask(live_bits: usize) -> u64 {
     }
 }
 
+#[cfg(test)]
 fn remove_bit_at(value: u64, position: usize) -> u64 {
     let low_mask = if position == 0 {
         0
@@ -783,6 +862,7 @@ fn remove_bit_at(value: u64, position: usize) -> u64 {
     low | (high << position)
 }
 
+#[cfg(test)]
 fn insert_bit_at(value: u64, position: usize, bit: bool) -> u64 {
     let low_mask = if position == 0 {
         0
@@ -799,6 +879,7 @@ fn insert_bit_at(value: u64, position: usize, bit: bool) -> u64 {
         }
 }
 
+#[cfg(test)]
 fn pack_words_with_width(words: &[u64], live_bits: usize) -> Vec<u8> {
     let bytes_per_word = live_bits.div_ceil(8);
     let mut out = Vec::with_capacity(words.len() * bytes_per_word);
@@ -808,6 +889,7 @@ fn pack_words_with_width(words: &[u64], live_bits: usize) -> Vec<u8> {
     out
 }
 
+#[cfg(test)]
 fn unpack_words_with_width(
     bytes: &[u8],
     word_count: usize,
@@ -839,6 +921,7 @@ fn pack_bools_local(bits: &[bool]) -> Vec<u8> {
     out
 }
 
+#[cfg(test)]
 fn unpack_bools_local(bytes: &[u8], count: usize) -> Result<Vec<bool>, String> {
     let expected = count.div_ceil(8);
     if bytes.len() != expected {
