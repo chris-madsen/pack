@@ -1,42 +1,11 @@
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum BlockMode {
-    Raw = 0,
-    Spectral = 1,
-    AlphabetBreadcrumbs = 2,
-    Trajectory = 3,
-    Operator = 4,
-    SparseAlphabet = 5,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LayerSummary {
-    pub window_min_bits: u32,
-    pub window_max_bits: u32,
-    pub input_size: u64,
-    pub output_size: u64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ArchiveHeader {
-    pub base_version: u8,
-    pub window_min_exp: u8,
-    pub window_max_exp: u8,
-    pub original_size: u64,
-    pub block_count: u32,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BlockRecord {
-    pub window_index: u8,
-    pub encoding: BlockEncoding,
-}
-
+/// A raw (uncompressed) block.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RawBlock {
     pub original_len: u32,
     pub payload: Vec<u8>,
 }
 
+/// Alphabet-coded block (dense).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AlphabetBlock {
     pub original_len: u32,
@@ -45,6 +14,7 @@ pub struct AlphabetBlock {
     pub breadcrumbs: Vec<u8>,
 }
 
+/// Alphabet-coded block (sparse exceptions).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SparseAlphabetBlock {
     pub original_len: u32,
@@ -56,6 +26,7 @@ pub struct SparseAlphabetBlock {
     pub exception_positions: Vec<u8>,
 }
 
+/// Spectral-predictor block.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SpectralBlock {
     pub original_len: u32,
@@ -63,6 +34,7 @@ pub struct SpectralBlock {
     pub residual: Vec<u8>,
 }
 
+/// Parity-trajectory block.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TrajectoryBlock {
     pub original_len: u32,
@@ -71,6 +43,14 @@ pub struct TrajectoryBlock {
     pub terminal_indices: Vec<u8>,
     pub steps: u8,
     pub breadcrumbs: Vec<u8>,
+}
+
+/// Strict-operator (Walsh-generator) block.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum OperatorTerminalMode {
+    RawSeed = 0,
+    PaletteSeed = 1,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -84,59 +64,86 @@ pub struct OperatorBlock {
     pub terminal_payload: Vec<u8>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum OperatorTerminalMode {
-    RawSeed = 0,
-    PaletteSeed = 1,
+/// Adaptive-window block (mode 0x06).
+/// Wire: [0xAD tag(1)] [K u64 LE(8)] [V-len u32 LE(4)] [V(...)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdaptiveWindowBlock {
+    /// Original (uncompressed) byte length of the window.
+    pub original_len: u32,
+    /// Packed MetaK descriptor (u64 LE).
+    pub meta_k: u64,
+    /// Branch-correction vector V.
+    pub v: Vec<u8>,
 }
 
+/// Unified block encoding discriminant.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BlockEncoding {
     Raw(RawBlock),
-    Alphabet(AlphabetBlock),
-    SparseAlphabet(SparseAlphabetBlock),
     Spectral(SpectralBlock),
+    Alphabet(AlphabetBlock),
     Trajectory(TrajectoryBlock),
     Operator(OperatorBlock),
+    SparseAlphabet(SparseAlphabetBlock),
+    Adaptive(AdaptiveWindowBlock),
 }
 
 impl BlockEncoding {
-    pub fn mode(&self) -> BlockMode {
+    pub fn mode(&self) -> u8 {
         match self {
-            Self::Raw(_) => BlockMode::Raw,
-            Self::Alphabet(_) => BlockMode::AlphabetBreadcrumbs,
-            Self::SparseAlphabet(_) => BlockMode::SparseAlphabet,
-            Self::Spectral(_) => BlockMode::Spectral,
-            Self::Trajectory(_) => BlockMode::Trajectory,
-            Self::Operator(_) => BlockMode::Operator,
+            Self::Raw(_) => 0,
+            Self::Spectral(_) => 1,
+            Self::Alphabet(_) => 2,
+            Self::Trajectory(_) => 3,
+            Self::Operator(_) => 4,
+            Self::SparseAlphabet(_) => 5,
+            Self::Adaptive(_) => 6,
         }
     }
 }
 
+/// Archive block record (window index + encoding).
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Archive {
-    pub header: ArchiveHeader,
-    pub blocks: Vec<BlockRecord>,
+pub struct BlockRecord {
+    pub window_index: u8,
+    pub encoding: BlockEncoding,
 }
 
+/// Block-level analysis results.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BlockAnalysis {
     pub unique_sorted_bytes: Vec<u8>,
 }
 
+/// Window band (min/max in bits, both powers of two).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PassWindowBand {
     pub min_window_bits: u32,
     pub max_window_bits: u32,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct CompressionReport {
-    pub source_name: String,
+/// Per-layer summary stored in a recursive archive.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LayerSummary {
+    pub window_min_bits: u32,
+    pub window_max_bits: u32,
+    pub input_size: u64,
+    pub output_size: u64,
+}
+
+/// Archive header.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArchiveHeader {
+    pub base_version: u8,
+    pub window_min_exp: u8,
+    pub window_max_exp: u8,
     pub original_size: u64,
-    pub packed_size: u64,
-    pub ratio: f64,
-    pub layer_count: usize,
-    pub layer_summaries: Vec<LayerSummary>,
-    pub roundtrip_ok: bool,
+    pub block_count: u32,
+}
+
+/// Full single-layer archive.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Archive {
+    pub header: ArchiveHeader,
+    pub blocks: Vec<BlockRecord>,
 }
