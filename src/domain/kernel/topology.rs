@@ -295,10 +295,15 @@ fn strongest_word_parity_feature(bytes: &[u8]) -> Result<WordParityFeature, Stri
                 matching_words: ones.max(zeros),
             }
         })
+        // Primary key: maximise matching_words (predictability).
+        // Tiebreaker: prefer sparser masks (fewer set bits) — a sparse mask XORs
+        // fewer bit positions, keeping the parity bit more predictable and
+        // increasing branch-log sparsity in contract_block.
+        // Final tiebreaker: deterministic ordering by mask value.
         .max_by_key(|feature| {
             (
                 feature.matching_words,
-                feature.mask.count_ones(),
+                std::cmp::Reverse(feature.mask.count_ones()),
                 std::cmp::Reverse(feature.mask),
             )
         })
@@ -1032,6 +1037,32 @@ mod tests {
             differing_bits >= 8,
             "phase_mask and affine_mask too similar: XOR has only {} differing bits (want ≥ 8)",
             differing_bits
+        );
+    }
+
+    /// Sparse parity masks must be preferred over dense masks at equal matching_words.
+    /// A sparser mask XORs fewer bits, keeping parity more predictable and
+    /// increasing branch-log sparsity.
+    #[test]
+    fn sparse_parity_mask_is_preferred_over_dense_at_equal_matching_words() {
+        use super::strongest_word_parity_feature;
+        // Build 8 words where both mask=0x01 (1 bit set) and mask=0x03 (2 bits set)
+        // produce matching_words == 8 (all words match the dominant parity).
+        // All words have bit0=1 AND bit1=1, so parity(word & 0x01)=1 for all
+        // and parity(word & 0x03)=0 for all — both give matching_words=8.
+        // The fix must select mask=0x01 (sparser).
+        let word: u64 = 0x0000_0000_0000_0003; // bit0=1, bit1=1
+        let bytes: Vec<u8> = std::iter::repeat(word.to_le_bytes())
+            .take(8)
+            .flatten()
+            .collect();
+        let feature = strongest_word_parity_feature(&bytes).unwrap();
+        assert_eq!(
+            feature.mask.count_ones(),
+            1,
+            "expected sparse mask (1 bit set), got mask=0x{:016X} with {} bits set",
+            feature.mask,
+            feature.mask.count_ones()
         );
     }
 }
