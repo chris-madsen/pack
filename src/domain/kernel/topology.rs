@@ -458,9 +458,18 @@ pub fn compile_strict_operator_steps(
     let derivative_density = derivative_ones * 1024 / signature.derivative.len().max(1);
     let shift_coherence = signature.shift_scores[0].matching_bits * 1024 / signature.bit_len.max(1);
     let window_factor = (window_bits.ilog2().saturating_sub(7) as usize).min(3);
-    let structured = dominance / 192 + shift_coherence / 320 + window_factor;
-    let noisy = derivative_density / 256;
-    Ok(structured.saturating_sub(noisy).clamp(1, 8) as u8)
+    if derivative_density >= 640 && dominance <= 704 {
+        return Ok(1);
+    }
+    if derivative_density >= 512 && shift_coherence <= 640 {
+        return Ok(1);
+    }
+    if derivative_density >= 384 {
+        return Ok(2);
+    }
+    let structured = dominance / 256 + shift_coherence / 384 + window_factor;
+    let noisy = derivative_density / 320;
+    Ok(structured.saturating_sub(noisy).clamp(1, 4) as u8)
 }
 
 pub fn parse_strict_key_layout(bit_len: u16, bytes: &[u8]) -> Result<StrictKeyLayout, String> {

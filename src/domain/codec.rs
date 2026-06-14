@@ -32,6 +32,8 @@ const LAYER_SUMMARY_BYTES: usize = 18;
 const MIN_WINDOW_BYTES: usize = 16;
 const MAX_WINDOW_BYTES: usize = 2048;
 const STRICT_GENERATOR_GAIN_FRACTION: f64 = 0.9;
+const OPERATOR_BLOCK_FIXED_OVERHEAD_BITS: u64 = 18 * 8;
+const STRICT_OPERATOR_MIN_TERMINAL_BITS: u64 = 64;
 /// Byte length of the PACKMVP1 single-layer archive header:
 /// magic(8) + version(1) + window_min_exp(1) + window_max_exp(1)
 /// + original_size(8) + block_count(4) = 23 bytes.
@@ -368,17 +370,17 @@ fn analyze_strict_pass_band(
         });
     }
 
-    let mut scored = Vec::new();
-    for &size in &available {
+    let mut candidates = Vec::new();
+    for (index, &size) in available.iter().enumerate() {
         let Some(prefix) = input.get(..size) else {
             continue;
         };
-        let Ok(signature) = analyze_topology(prefix) else {
+        let Ok(candidate) = analyze_strict_window_candidate(prefix, index as u8) else {
             continue;
         };
-        scored.push((size, strict_window_metrics(&signature)));
+        candidates.push(candidate);
     }
-    if scored.is_empty() {
+    if candidates.is_empty() {
         let fallback = hint.unwrap_or(*available.first().unwrap());
         return Ok(PassWindowBand {
             min_window_bits: (fallback * 8) as u32,
@@ -386,22 +388,34 @@ fn analyze_strict_pass_band(
         });
     }
 
-    let best = scored
+    let best = candidates
         .iter()
-        .max_by_key(|(_, metrics)| metrics.score)
-        .map(|(_, metrics)| *metrics)
+        .max_by_key(|candidate| candidate.metrics.score)
+        .map(|candidate| candidate.metrics)
         .unwrap();
-    let mut min_bytes = scored
+    let economic_min = candidates
         .iter()
-        .find(|(_, metrics)| !metrics.noisy && metrics.score * 100 >= best.score * 72)
-        .map(|(size, _)| *size)
-        .unwrap_or(scored[0].0);
-    let mut max_bytes = scored
+        .find(|candidate| (candidate.floor_bits * 10) < (candidate.size * 8) as u64)
+        .map(|candidate| candidate.size);
+    let mut min_bytes = candidates
+        .iter()
+        .find(|candidate| {
+            !candidate.metrics.noisy && candidate.metrics.score * 100 >= best.score * 72
+        })
+        .map(|candidate| candidate.size)
+        .unwrap_or(candidates[0].size);
+    let mut max_bytes = candidates
         .iter()
         .rev()
-        .find(|(_, metrics)| metrics.structured || metrics.score * 100 >= best.score * 88)
-        .map(|(size, _)| *size)
-        .unwrap_or(scored.last().unwrap().0);
+        .find(|candidate| {
+            candidate.metrics.structured || candidate.metrics.score * 100 >= best.score * 88
+        })
+        .map(|candidate| candidate.size)
+        .unwrap_or(candidates.last().unwrap().size);
+    if let Some(required) = economic_min {
+        min_bytes = min_bytes.max(required);
+        max_bytes = max_bytes.max(required);
+    }
     if let Some(anchor) = hint {
         min_bytes = min_bytes.min(anchor);
         max_bytes = max_bytes.max(anchor).min(*available.last().unwrap());
@@ -415,6 +429,30 @@ fn analyze_strict_pass_band(
     Ok(PassWindowBand {
         min_window_bits: (min_bytes * 8) as u32,
         max_window_bits: (max_bytes * 8) as u32,
+    })
+}
+
+fn analyze_strict_window_candidate(
+    block: &[u8],
+    index: u8,
+) -> Result<StrictWindowCandidate, String> {
+    let signature = analyze_topology(block)?;
+    let metrics = strict_window_metrics(&signature);
+    let key = compile_strict_operator_key(&signature, block.len() * 8)?;
+    let steps = compile_strict_operator_steps(&signature, block.len() * 8)?;
+    let word_count = block.len() / 8;
+    let breadcrumb_bits = word_count as u64 * steps as u64;
+    let floor_bits = key.bit_len as u64
+        + breadcrumb_bits
+        + OPERATOR_BLOCK_FIXED_OVERHEAD_BITS
+        + STRICT_OPERATOR_MIN_TERMINAL_BITS;
+    Ok(StrictWindowCandidate {
+        index,
+        size: block.len(),
+        signature,
+        metrics,
+        steps,
+        floor_bits,
     })
 }
 
@@ -635,6 +673,16 @@ struct StrictWindowMetrics {
     noisy: bool,
 }
 
+#[derive(Clone, Debug)]
+struct StrictWindowCandidate {
+    index: u8,
+    size: usize,
+    signature: TopologySignature,
+    metrics: StrictWindowMetrics,
+    steps: u8,
+    floor_bits: u64,
+}
+
 #[cfg(test)]
 fn compress_single_layer_bytes(input: &[u8], band: PassWindowBand) -> Result<Vec<u8>, String> {
     compress_single_layer_bytes_with_profile(input, band, CompressionProfile::General)
@@ -721,26 +769,31 @@ fn select_strict_window_plan(
     if fitting.is_empty() {
         return Ok(None);
     }
-    let (_max_index, max_size) = fitting[fitting.len() - 1];
-    let signature = analyze_topology(&input[..max_size])?;
-    let metrics = strict_window_metrics(&signature);
-    let position = if metrics.structured {
-        fitting.len() - 1
-    } else if metrics.noisy {
-        0
-    } else {
-        ((metrics.score.saturating_sub(256)) * (fitting.len() - 1) / 1024).min(fitting.len() - 1)
-    };
-    let (selected_index, selected_size) = fitting[position];
-    let selected_signature = if selected_size == max_size {
-        signature
-    } else {
-        analyze_topology(&input[..selected_size])?
-    };
+    let mut candidates = fitting
+        .into_iter()
+        .map(|(index, size)| analyze_strict_window_candidate(&input[..size], index as u8))
+        .collect::<Result<Vec<_>, _>>()?;
+    candidates.sort_by_key(|candidate| candidate.size);
+    let eligible = candidates
+        .iter()
+        .filter(|candidate| (candidate.floor_bits * 10) < (candidate.size * 8) as u64)
+        .max_by_key(|candidate| {
+            (
+                candidate.size,
+                candidate.metrics.score,
+                usize::MAX.saturating_sub(candidate.steps as usize),
+            )
+        });
+    let selected = eligible.unwrap_or_else(|| {
+        candidates
+            .iter()
+            .max_by_key(|candidate| (candidate.size, candidate.metrics.score))
+            .unwrap()
+    });
     Ok(Some((
-        selected_index as u8,
-        selected_size,
-        selected_signature,
+        selected.index,
+        selected.size,
+        selected.signature.clone(),
     )))
 }
 
@@ -1005,6 +1058,7 @@ fn try_encode_operator_block(
     let policy = match profile {
         CompressionProfile::General => CompressionPolicy::MVP,
         CompressionProfile::StrictGeneratorOnly => CompressionPolicy {
+            max_key_bits: u64::MAX,
             minimum_gain_fraction: STRICT_GENERATOR_GAIN_FRACTION,
             ..CompressionPolicy::MVP
         },
@@ -1021,18 +1075,7 @@ fn try_encode_operator_block(
     else {
         return Ok(None);
     };
-    let operator = extract_operator_block(&candidate).unwrap();
-    let overhead_bytes = encoded_size_of(&candidate)
-        .checked_sub(operator.key.len())
-        .and_then(|value| value.checked_sub(operator.breadcrumbs.len()))
-        .and_then(|value| value.checked_sub(operator.terminal_payload.len()))
-        .ok_or_else(|| "operator block accounting underflow".to_string())?;
-    let budget = BitBudget {
-        source_bits: (block.len() * 8) as u64,
-        key_bits: key.bit_len as u64,
-        crumb_bits: (operator.breadcrumbs.len() * 8) as u64,
-        overhead_bits: (overhead_bytes * 8) as u64,
-    };
+    let budget = operator_budget(&candidate, block.len())?;
     Ok(policy.accepts(budget)?.then_some(candidate))
 }
 
@@ -1084,6 +1127,7 @@ fn debug_strict_operator_block(block: &[u8], offset: usize) -> Result<GeneratorD
         .collect::<Vec<_>>();
     let breadcrumbs = apply_strict_operator_schedule(&mut words, key.bit_len, &key.bytes, steps)?;
     let policy = CompressionPolicy {
+        max_key_bits: u64::MAX,
         minimum_gain_fraction: STRICT_GENERATOR_GAIN_FRACTION,
         ..CompressionPolicy::MVP
     };
@@ -1112,17 +1156,7 @@ fn debug_strict_operator_block(block: &[u8], offset: usize) -> Result<GeneratorD
         });
     };
     let operator = extract_operator_block(&candidate).unwrap();
-    let overhead_bytes = encoded_size_of(&candidate)
-        .checked_sub(operator.key.len())
-        .and_then(|value| value.checked_sub(operator.breadcrumbs.len()))
-        .and_then(|value| value.checked_sub(operator.terminal_payload.len()))
-        .ok_or_else(|| "operator block accounting underflow".to_string())?;
-    let budget = BitBudget {
-        source_bits: (block.len() * 8) as u64,
-        key_bits: key.bit_len as u64,
-        crumb_bits: (operator.breadcrumbs.len() * 8) as u64,
-        overhead_bits: (overhead_bytes * 8) as u64,
-    };
+    let budget = operator_budget(&candidate, block.len())?;
 
     Ok(if policy.accepts(budget)? {
         let operator = extract_operator_block(&candidate).unwrap();
@@ -1253,15 +1287,49 @@ fn encode_operator_sparse_exceptions(
             exception_values.push(word);
         }
     }
+    let delta_positions = encode_position_deltas(&exception_positions);
+    let bitmap_positions = if words.len() <= 64 {
+        let mut bitmap = 0_u64;
+        for position in &exception_positions {
+            bitmap |= 1_u64 << position;
+        }
+        Some(bitmap.to_le_bytes().to_vec())
+    } else {
+        None
+    };
+    let (position_mode, position_bytes) = match bitmap_positions {
+        Some(bitmap) if bitmap.len() < delta_positions.len() => (1_u8, bitmap),
+        _ => (0_u8, delta_positions),
+    };
+
+    let xor_deltas = exception_values
+        .iter()
+        .map(|value| *value ^ dominant_word)
+        .collect::<Vec<_>>();
+    let delta_width = xor_deltas
+        .iter()
+        .map(|delta| 64_u8.saturating_sub(delta.leading_zeros() as u8))
+        .max()
+        .unwrap_or(0);
+    let packed_delta_values = if delta_width == 0 {
+        Vec::new()
+    } else if delta_width < 64 {
+        pack_operator_word_values(&xor_deltas, delta_width)
+    } else {
+        xor_deltas
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect()
+    };
+
     let mut payload = Vec::new();
     payload.extend_from_slice(&dominant_word.to_le_bytes());
     push_u16(&mut payload, exception_positions.len() as u16);
-    let position_bytes = encode_position_deltas(&exception_positions);
+    payload.push(position_mode);
     push_u32(&mut payload, position_bytes.len() as u32);
     payload.extend_from_slice(&position_bytes);
-    for value in &exception_values {
-        payload.extend_from_slice(&value.to_le_bytes());
-    }
+    payload.push(delta_width);
+    payload.extend_from_slice(&packed_delta_values);
     Ok(Some(OperatorTerminalCandidate {
         mode: OperatorTerminalMode::SparseWordExceptions,
         payload,
@@ -1769,33 +1837,116 @@ fn decode_operator_sparse_exceptions(
     payload: &[u8],
     word_count: usize,
 ) -> Result<Vec<u64>, String> {
-    if payload.len() < 14 {
+    if payload.len() < 15 {
         return Err("operator sparse-exception payload is truncated".to_string());
     }
     let dominant_word = u64::from_le_bytes(payload[..8].try_into().unwrap());
     let mut cursor = 8;
     let exception_count = read_u16(payload, &mut cursor)? as usize;
+    let position_mode = read_u8(payload, &mut cursor)?;
     let position_len = read_u32(payload, &mut cursor)? as usize;
     let position_bytes = read_vec(payload, &mut cursor, position_len)?;
-    let positions = decode_position_deltas(&position_bytes)?;
+    let positions = match position_mode {
+        0 => decode_position_deltas(&position_bytes)?,
+        1 => decode_operator_position_bitmap(&position_bytes, word_count)?,
+        _ => return Err("operator sparse-exception position mode is unknown".to_string()),
+    };
     if positions.len() != exception_count {
         return Err("operator sparse-exception position count does not match header".to_string());
     }
-    let expected_value_bytes = exception_count
-        .checked_mul(8)
-        .ok_or_else(|| "operator sparse-exception value length overflow".to_string())?;
-    let values = read_vec(payload, &mut cursor, expected_value_bytes)?;
-    if cursor != payload.len() {
+    let delta_width = read_u8(payload, &mut cursor)?;
+    let xor_deltas = if delta_width == 0 {
+        vec![0_u64; exception_count]
+    } else if delta_width < 64 {
+        let packed_len = ceil_div_u64(exception_count as u64 * delta_width as u64, 8) as usize;
+        let values = read_vec(payload, &mut cursor, packed_len)?;
+        unpack_operator_word_values(&values, delta_width, exception_count)?
+    } else {
+        let expected_value_bytes = exception_count
+            .checked_mul(8)
+            .ok_or_else(|| "operator sparse-exception value length overflow".to_string())?;
+        let values = read_vec(payload, &mut cursor, expected_value_bytes)?;
+        values
+            .chunks_exact(8)
+            .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
+            .collect()
+    };
+    if cursor != payload.len() || xor_deltas.len() != exception_count {
         return Err("operator sparse-exception payload has trailing bytes".to_string());
     }
     let mut out = vec![dominant_word; word_count];
-    for (position, chunk) in positions.iter().copied().zip(values.chunks_exact(8)) {
+    for (position, delta) in positions.iter().copied().zip(xor_deltas) {
         if position >= word_count {
             return Err("operator sparse-exception position is out of range".to_string());
         }
-        out[position] = u64::from_le_bytes(chunk.try_into().unwrap());
+        out[position] = dominant_word ^ delta;
     }
     Ok(out)
+}
+
+fn operator_budget(
+    candidate: &BlockEncoding,
+    source_len_bytes: usize,
+) -> Result<BitBudget, String> {
+    let operator = extract_operator_block(candidate)
+        .ok_or_else(|| "operator budget requires an operator candidate".to_string())?;
+    let overhead_bytes = encoded_size_of(candidate)
+        .checked_sub(operator.key.len())
+        .and_then(|value| value.checked_sub(operator.breadcrumbs.len()))
+        .and_then(|value| value.checked_sub(operator.terminal_payload.len()))
+        .ok_or_else(|| "operator block accounting underflow".to_string())?;
+    Ok(BitBudget {
+        source_bits: (source_len_bytes * 8) as u64,
+        key_bits: operator.key_bits as u64,
+        crumb_bits: ((operator.breadcrumbs.len() + operator.terminal_payload.len()) * 8) as u64,
+        overhead_bits: (overhead_bytes * 8) as u64,
+    })
+}
+
+fn decode_operator_position_bitmap(bytes: &[u8], word_count: usize) -> Result<Vec<usize>, String> {
+    if bytes.len() != 8 || word_count > 64 {
+        return Err("operator sparse-exception bitmap length is not canonical".to_string());
+    }
+    let bitmap = u64::from_le_bytes(bytes.try_into().unwrap());
+    Ok((0..word_count)
+        .filter(|position| ((bitmap >> position) & 1) == 1)
+        .collect())
+}
+
+fn pack_operator_word_values(values: &[u64], bit_width: u8) -> Vec<u8> {
+    let mut out = vec![0_u8; ceil_div_u64(values.len() as u64 * bit_width as u64, 8) as usize];
+    let mut cursor = 0_usize;
+    for value in values {
+        for bit_index in 0..bit_width as usize {
+            let bit = ((value >> bit_index) & 1) as u8;
+            out[cursor / 8] |= bit << (cursor % 8);
+            cursor += 1;
+        }
+    }
+    out
+}
+
+fn unpack_operator_word_values(
+    bytes: &[u8],
+    bit_width: u8,
+    value_count: usize,
+) -> Result<Vec<u64>, String> {
+    let expected = ceil_div_u64(value_count as u64 * bit_width as u64, 8) as usize;
+    if bytes.len() != expected {
+        return Err("operator sparse-exception packed values length is not canonical".to_string());
+    }
+    let mut values = Vec::with_capacity(value_count);
+    let mut cursor = 0_usize;
+    for _ in 0..value_count {
+        let mut value = 0_u64;
+        for bit_index in 0..bit_width as usize {
+            let bit = (bytes[cursor / 8] >> (cursor % 8)) & 1;
+            value |= (bit as u64) << bit_index;
+            cursor += 1;
+        }
+        values.push(value);
+    }
+    Ok(values)
 }
 
 fn pack_bools(bits: &[bool]) -> Vec<u8> {
