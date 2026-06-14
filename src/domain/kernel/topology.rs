@@ -45,6 +45,7 @@ pub struct TopologySignature {
     pub popcnt_profile: Vec<u8>,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StrictKeyLayout {
     pub phase_bits: u8,
@@ -59,6 +60,7 @@ pub struct StrictKeyLayout {
     pub parity_present: bool,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StrictOperatorKey {
     pub bit_len: u16,
@@ -285,6 +287,7 @@ pub fn compile_spectral_key(signature: &TopologySignature) -> Result<MagicKey, S
     })
 }
 
+#[cfg(test)]
 pub fn compile_strict_operator_key(
     signature: &TopologySignature,
     window_bits: usize,
@@ -430,6 +433,7 @@ pub fn compile_strict_operator_key(
     })
 }
 
+#[cfg(test)]
 pub fn compile_strict_operator_steps(
     signature: &TopologySignature,
     window_bits: usize,
@@ -466,6 +470,7 @@ pub fn compile_strict_operator_steps(
     Ok(structured.saturating_sub(noisy).clamp(1, 4) as u8)
 }
 
+#[cfg(test)]
 pub fn parse_strict_key_layout(bit_len: u16, bytes: &[u8]) -> Result<StrictKeyLayout, String> {
     let expected_bytes = (bit_len as usize).div_ceil(8);
     if bytes.len() != expected_bytes {
@@ -533,6 +538,7 @@ pub fn parse_strict_key_layout(bit_len: u16, bytes: &[u8]) -> Result<StrictKeyLa
     })
 }
 
+#[cfg(test)]
 fn mix_feature_word(signature: &TopologySignature, salt: usize) -> u64 {
     let derivative_fold =
         signature
@@ -568,12 +574,14 @@ fn mix_feature_word(signature: &TopologySignature, salt: usize) -> u64 {
     )
 }
 
+#[cfg(test)]
 #[derive(Default)]
 struct BitWriter {
     bytes: Vec<u8>,
     bit_len: usize,
 }
 
+#[cfg(test)]
 impl BitWriter {
     fn push_bits(&mut self, value: u64, bit_count: u8) {
         for bit_index in 0..bit_count {
@@ -592,12 +600,14 @@ impl BitWriter {
     }
 }
 
+#[cfg(test)]
 struct BitReader<'a> {
     bytes: &'a [u8],
     bit_len: u16,
     cursor: usize,
 }
 
+#[cfg(test)]
 impl<'a> BitReader<'a> {
     fn new(bytes: &'a [u8], bit_len: u16) -> Self {
         Self {

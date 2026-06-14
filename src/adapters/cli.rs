@@ -110,12 +110,22 @@ fn run_benchmark_generator_debug(args: &[String]) -> Result<(), String> {
     let block_size = parse_optional_block_size(args.get(3))?;
     let report = debug_file_generator_only_strict(&path, block_size)?;
     println!(
-        "{:<8} {:>8} {:<18} {:>6} {:<18} {:>8} {:>8} {:>8} {:>8} {:<24}",
-        "offset", "window", "key", "steps", "terminal", "K", "V", "ovh", "total", "status"
+        "{:<8} {:>8} {:<18} {:>6} {:<18} {:>8} {:>8} {:>8} {:>8} {:>8} {:<24}",
+        "offset",
+        "window",
+        "key",
+        "steps",
+        "terminal",
+        "K",
+        "seed",
+        "branches",
+        "ovh",
+        "total",
+        "status"
     );
     for item in report {
         println!(
-            "{:<8} {:>8} {:<18} {:>6} {:<18} {:>8} {:>8} {:>8} {:>8} {:<24}",
+            "{:<8} {:>8} {:<18} {:>6} {:<18} {:>8} {:>8} {:>8} {:>8} {:>8} {:<24}",
             item.offset,
             item.window_bytes,
             if item.key_hex.len() > 18 {
@@ -130,7 +140,8 @@ fn run_benchmark_generator_debug(args: &[String]) -> Result<(), String> {
                 .map(|mode| format!("{mode:?}"))
                 .unwrap_or_else(|| "-".to_string()),
             item.key_bits,
-            item.crumb_bits,
+            item.seed_bits,
+            item.branch_bits,
             item.overhead_bits,
             item.total_bits,
             if item.accepted {

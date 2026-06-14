@@ -6,6 +6,7 @@ use crate::domain::kernel::reversible::{
     feistel_forward, feistel_inverse, FeistelKey, FeistelRoundKey,
 };
 use crate::domain::kernel::spectral::normalized_fwht;
+#[cfg(test)]
 use crate::domain::kernel::topology::parse_strict_key_layout;
 
 pub const OPERATOR_BLOCK_WORDS: usize = 64;
@@ -254,6 +255,7 @@ pub fn strongest_binary_word_peaks(
     Ok(peaks)
 }
 
+#[cfg(test)]
 pub fn apply_strict_operator_step(
     words: &mut [u64],
     key_bits: u16,
@@ -271,6 +273,7 @@ pub fn apply_strict_operator_step(
     Ok(())
 }
 
+#[cfg(test)]
 pub fn apply_strict_operator_inverse_step(
     words: &mut [u64],
     key_bits: u16,
@@ -288,6 +291,7 @@ pub fn apply_strict_operator_inverse_step(
     Ok(())
 }
 
+#[cfg(test)]
 pub fn apply_strict_operator_schedule(
     words: &mut [u64],
     key_bits: u16,
@@ -494,6 +498,7 @@ fn apply_slice_butterfly_inverse(words: &mut [u64]) {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct StrictOperatorParams {
     phase_seed: u64,
@@ -507,6 +512,7 @@ struct StrictOperatorParams {
     odd_multiplier: u64,
 }
 
+#[cfg(test)]
 fn strict_word_forward(value: u64, params: &StrictOperatorParams, word_index: usize) -> u64 {
     let phase = strict_phase_mask(params.phase_seed, params.parity_seed, word_index);
     let affine = strict_affine_mask(params.affine_seed, params.parity_seed, word_index);
@@ -519,6 +525,7 @@ fn strict_word_forward(value: u64, params: &StrictOperatorParams, word_index: us
     out.rotate_right(params.rotate_beta as u32)
 }
 
+#[cfg(test)]
 fn strict_word_inverse(value: u64, params: &StrictOperatorParams, word_index: usize) -> u64 {
     let phase = strict_phase_mask(params.phase_seed, params.parity_seed, word_index);
     let affine = strict_affine_mask(params.affine_seed, params.parity_seed, word_index);
@@ -531,16 +538,19 @@ fn strict_word_inverse(value: u64, params: &StrictOperatorParams, word_index: us
     out ^ phase
 }
 
+#[cfg(test)]
 fn strict_phase_mask(seed: u64, parity_seed: u8, word_index: usize) -> u64 {
     seed.rotate_left(((word_index * 7) % 64) as u32)
         ^ repeat_byte(parity_seed).rotate_right(((word_index * 3) % 64) as u32)
 }
 
+#[cfg(test)]
 fn strict_affine_mask(seed: u64, parity_seed: u8, word_index: usize) -> u64 {
     seed.rotate_right(((word_index * 11) % 64) as u32)
         ^ repeat_byte(parity_seed.wrapping_mul(17)).rotate_left(((word_index * 5) % 64) as u32)
 }
 
+#[cfg(test)]
 fn strict_word_breadcrumb(
     value: u64,
     params: &StrictOperatorParams,
@@ -570,6 +580,7 @@ fn strict_word_breadcrumb(
     parity(value & conflict) == 1
 }
 
+#[cfg(test)]
 fn parse_strict_params(key_bits: u16, key: &[u8]) -> Result<StrictOperatorParams, String> {
     let layout = parse_strict_key_layout(key_bits, key)?;
     let mut reader = StrictBitReader::new(key, key_bits);
@@ -616,12 +627,14 @@ fn parse_strict_params(key_bits: u16, key: &[u8]) -> Result<StrictOperatorParams
     })
 }
 
+#[cfg(test)]
 struct StrictBitReader<'a> {
     bytes: &'a [u8],
     bit_len: u16,
     cursor: usize,
 }
 
+#[cfg(test)]
 impl<'a> StrictBitReader<'a> {
     fn new(bytes: &'a [u8], bit_len: u16) -> Self {
         Self {

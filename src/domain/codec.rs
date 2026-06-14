@@ -83,7 +83,8 @@ pub struct GeneratorDebugBlock {
     pub steps: Option<u8>,
     pub terminal_mode: Option<OperatorTerminalMode>,
     pub key_bits: u64,
-    pub crumb_bits: u64,
+    pub seed_bits: u64,
+    pub branch_bits: u64,
     pub overhead_bits: u64,
     pub total_bits: u64,
     pub accepted: bool,
@@ -136,7 +137,8 @@ pub fn debug_generator_only_strict(
                 steps: None,
                 terminal_mode: None,
                 key_bits: 0,
-                crumb_bits: (remaining.len() * 8) as u64,
+                seed_bits: (remaining.len() * 8) as u64,
+                branch_bits: 0,
                 overhead_bits: 0,
                 total_bits: (remaining.len() * 8) as u64,
                 accepted: false,
@@ -1103,7 +1105,8 @@ fn debug_strict_operator_block(block: &[u8], offset: usize) -> Result<GeneratorD
             steps: None,
             terminal_mode: None,
             key_bits: 0,
-            crumb_bits: (block.len() * 8) as u64,
+            seed_bits: (block.len() * 8) as u64,
+            branch_bits: 0,
             overhead_bits: 0,
             total_bits: (block.len() * 8) as u64,
             accepted: false,
@@ -1139,7 +1142,8 @@ fn debug_strict_operator_block(block: &[u8], offset: usize) -> Result<GeneratorD
                 steps: Some(steps),
                 terminal_mode: Some(operator.terminal_mode),
                 key_bits: budget.key_bits,
-                crumb_bits: budget.payload_bits()?,
+                seed_bits: budget.seed_bits,
+                branch_bits: budget.branch_bits,
                 overhead_bits: budget.overhead_bits,
                 total_bits: budget.encoded_bits()?,
                 accepted: true,
@@ -1153,7 +1157,8 @@ fn debug_strict_operator_block(block: &[u8], offset: usize) -> Result<GeneratorD
                 steps: Some(steps),
                 terminal_mode: Some(operator.terminal_mode),
                 key_bits: budget.key_bits,
-                crumb_bits: budget.payload_bits()?,
+                seed_bits: budget.seed_bits,
+                branch_bits: budget.branch_bits,
                 overhead_bits: budget.overhead_bits,
                 total_bits: budget.encoded_bits()?,
                 accepted: false,
@@ -2320,6 +2325,23 @@ mod compact_codec_tests {
         assert_eq!(decode_operator_block(&block).unwrap(), input);
         assert_eq!(block.key.len(), (block.key_bits as usize).div_ceil(8));
         assert!(block.steps > 0);
+
+        let budget =
+            super::operator_budget(&BlockEncoding::Operator(block.clone()), input.len()).unwrap();
+        assert_eq!(budget.seed_bits, (block.terminal_payload.len() * 8) as u64);
+        assert_eq!(budget.branch_bits, (block.breadcrumbs.len() * 8) as u64);
+
+        let mut missing_branches = block.clone();
+        missing_branches.breadcrumbs.clear();
+        assert!(decode_operator_block(&missing_branches).is_err());
+
+        let mut changed_branch = block.clone();
+        changed_branch.breadcrumbs[0] ^= 1;
+        assert_ne!(decode_operator_block(&changed_branch).unwrap(), input);
+
+        let mut mismatched_rounds = block;
+        mismatched_rounds.steps = mismatched_rounds.steps.saturating_add(1);
+        assert!(decode_operator_block(&mismatched_rounds).is_err());
     }
 
     #[test]
